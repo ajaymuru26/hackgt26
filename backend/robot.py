@@ -209,7 +209,7 @@ class Robot:
             self.command("$X")  # clear any alarm left from a previous session
         except RobotError:
             pass
-        self.message = "Connected to the simulated robot" if port == SIM else f"Connected to GRBL on {port}"
+        self.message = "Connected to the simulated robot" if port == SIM else f"Connected to the plotter on {port}"
 
     def disconnect(self):
         self.stop_flag.set()
