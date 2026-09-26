@@ -25,7 +25,7 @@ body {
 
 .wall {
   /* keep the whole board and tray visible without scrolling on laptop screens */
-  max-width: max(560px, min(1600px, calc((100vh - 250px) * 12 / 7 + 68px + 340px)));
+  max-width: max(560px, min(1840px, calc((100vh - 250px) * 12 / 7 + 68px + 340px + 240px)));
   margin: 0 auto;
   padding: 20px 20px 32px;
 }
@@ -50,9 +50,25 @@ h1 {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-columns: 240px minmax(0, 1fr) 320px;
   gap: 20px;
   align-items: start;
+}
+
+.history {
+  background: #fff;
+  border: 1px solid rgba(28, 34, 48, 0.12);
+  border-radius: 8px;
+  padding: 14px 12px 8px;
+  box-shadow: 0 6px 16px rgba(40, 55, 70, 0.12);
+  max-height: calc(100vh - 110px);
+  overflow-y: auto;
+}
+
+.history h2 {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+  color: var(--marker-black);
 }
 
 .stage { min-width: 0; }
@@ -292,9 +308,9 @@ h1 {
   .thought { animation: none; }
 }
 
-@media (max-width: 1000px) {
+@media (max-width: 1100px) {
   .workspace { grid-template-columns: 1fr; }
-  .thoughts { max-height: none; }
+  .history, .thoughts { max-height: none; }
 }
 
 /* The board: brushed aluminum frame around a white surface */
@@ -347,21 +363,11 @@ h1 {
 
 .tools, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.saved {
-  flex-basis: 100%;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-
-.saved-label { margin: 0; color: var(--marker-black); }
-
-.saved-empty { margin: 0; color: var(--marker-black); }
+.saved-empty { margin: 0 0 8px; color: #6b7682; }
 
 .saved-list {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 8px;
   margin: 0;
   padding: 0;
@@ -369,10 +375,32 @@ h1 {
 }
 
 .saved-list button {
-  max-width: 28ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  white-space: normal;
+}
+
+.history-kind {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--marker-blue);
+}
+
+.history-title {
+  font-weight: 700;
+  color: var(--marker-black);
+  overflow-wrap: anywhere;
+}
+
+.history-when {
+  font-size: 0.78rem;
+  color: #6b7682;
 }
 
 .status {

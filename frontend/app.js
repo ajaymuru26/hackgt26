@@ -1284,6 +1284,25 @@ function noteSaved(data) {
   loadSaved();
 }
 
+function historyTitle(board) {
+  const names = { math: "Math", answer: "Question", hint: "Hint", check: "Check", fill: "Pattern",
+                  drawing: "Drawing", speak: "Voice", ask: "Ask", write: "Writing", trace: "Image" };
+  const kind = names[board.mode] || names[board.source] || "Board";
+  const expr = (board.expression || "").trim();
+  const answer = (board.answer || "").trim();
+  const heard = (board.heard || "").trim();
+  const desc = (board.description || "").trim();
+  let body = board.label || "Saved board";
+  if (heard) body = heard;
+  else if (expr && answer && !expr.includes(answer)) body = `${expr} → ${answer}`;
+  else if (expr) body = expr;
+  else if (answer && desc && desc !== answer) body = `${desc} → ${answer}`;
+  else if (answer) body = answer;
+  else if (desc) body = desc;
+  else if (body.includes(": ")) body = body.slice(body.indexOf(": ") + 2);
+  return { kind, body };
+}
+
 async function loadSaved() {
   const list = $("savedList");
   const empty = $("savedEmpty");
@@ -1303,10 +1322,20 @@ async function loadSaved() {
       const item = document.createElement("li");
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "tool";
-      const when = board.created ? new Date(board.created).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
-      btn.textContent = board.label || board.mode || "Board";
-      btn.title = [when, board.seconds ? `${board.seconds} s` : ""].filter(Boolean).join(" · ");
+      const { kind, body } = historyTitle(board);
+      const when = board.created
+        ? new Date(board.created).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+        : "";
+      const kindEl = document.createElement("span");
+      kindEl.className = "history-kind";
+      kindEl.textContent = kind;
+      const titleEl = document.createElement("span");
+      titleEl.className = "history-title";
+      titleEl.textContent = body;
+      const whenEl = document.createElement("span");
+      whenEl.className = "history-when";
+      whenEl.textContent = [when, board.seconds ? `${board.seconds} s` : ""].filter(Boolean).join(" · ");
+      btn.append(kindEl, titleEl, whenEl);
       btn.onclick = () => openSaved(board.id);
       item.append(btn);
       list.append(item);

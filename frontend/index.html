@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=8">
+  <link rel="stylesheet" href="style.css?v=9">
 </head>
 <body>
   <main class="wall">
@@ -17,6 +17,11 @@
     </header>
 
     <div class="workspace">
+    <aside class="history" aria-labelledby="historyTitle">
+      <h2 id="historyTitle">History</h2>
+      <p id="savedEmpty" class="saved-empty">Finished boards show up here.</p>
+      <ol id="savedList" class="saved-list"></ol>
+    </aside>
     <div class="stage">
     <div class="frame">
       <canvas id="board" aria-label="Whiteboard drawing area"></canvas>
@@ -125,11 +130,6 @@
         <span id="robotStatus" class="robot-status" role="status" aria-live="polite">Not connected</span>
       </div>
 
-      <div class="saved">
-        <p class="saved-label">Saved boards</p>
-        <p id="savedEmpty" class="saved-empty">Finished boards are kept in MongoDB Atlas.</p>
-        <ol id="savedList" class="saved-list"></ol>
-      </div>
     </div>
     </div>
 
@@ -173,6 +173,6 @@
     </div>
     </div>
   </main>
-  <script src="app.js?v=7"></script>
+  <script src="app.js?v=8"></script>
 </body>
 </html>
