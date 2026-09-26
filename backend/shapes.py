@@ -7,6 +7,8 @@ It can also ask us to MIRROR the person's real strokes for symmetric drawings,
 and afterwards we SNAP loose ends onto the person's lines so nothing almost-touches.
 """
 import math
+import re
+from contextvars import ContextVar
 
 Point = list[float]
 Stroke = list[Point]
@@ -14,8 +16,47 @@ Stroke = list[Point]
 STEP = 12  # pixels between points along curves
 
 
+_ANCHORS: ContextVar[dict] = ContextVar("anchors", default={})
+
+
 def _pt(p) -> Point:
+    """A point is [x, y], or an anchor name like "K7" or "S2.end" that points at the person's ink."""
+    if isinstance(p, str):
+        key = p.strip().replace(" ", "")
+        anchors = _ANCHORS.get()
+        if key in anchors:
+            return list(anchors[key])
+        m = re.fullmatch(r"[Ss](\d+)", key)  # bare "S2" -> its centre
+        if m and f"S{m.group(1)}.center" in anchors:
+            return list(anchors[f"S{m.group(1)}.center"])
+        raise KeyError(f"unknown anchor {p}")
     return [float(p[0]), float(p[1])]
+
+
+def anchor_points(user_strokes: list[Stroke], max_corners=90):
+    """Name the useful points of the person's drawing so the AI can refer to them exactly.
+    Returns (anchors dict, per-stroke list of corner names)."""
+    anchors, per_stroke, k = {}, [], 0
+    for i, s in enumerate(user_strokes):
+        if not s:
+            per_stroke.append([])
+            continue
+        xs, ys = [p[0] for p in s], [p[1] for p in s]
+        anchors[f"S{i}.start"], anchors[f"S{i}.end"] = s[0], s[-1]
+        anchors[f"S{i}.top"] = min(s, key=lambda p: p[1])
+        anchors[f"S{i}.bottom"] = max(s, key=lambda p: p[1])
+        anchors[f"S{i}.left"] = min(s, key=lambda p: p[0])
+        anchors[f"S{i}.right"] = max(s, key=lambda p: p[0])
+        anchors[f"S{i}.center"] = [(min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2]
+        names = []
+        for p in simplify(s):
+            if k >= max_corners:
+                break
+            anchors[f"K{k}"] = p
+            names.append(f"K{k}")
+            k += 1
+        per_stroke.append(names)
+    return anchors, per_stroke
 
 
 def _n_steps(length: float) -> int:
@@ -25,7 +66,8 @@ def _n_steps(length: float) -> int:
 # ---------- summary of the person's strokes (sent to the AI) ----------
 
 def summarize_strokes(user_strokes: list[Stroke], max_strokes=60, max_points=12) -> str:
-    """Compact text list of the person's strokes with exact coordinates."""
+    """Compact text list of the person's strokes with exact coordinates and named corners."""
+    anchors, per_stroke = anchor_points(user_strokes)
     lines = []
     for i, s in enumerate(user_strokes[:max_strokes]):
         if not s:
@@ -36,9 +78,10 @@ def summarize_strokes(user_strokes: list[Stroke], max_strokes=60, max_points=12)
         if path[-1] is not s[-1]:
             path = path + [s[-1]]
         path_txt = " ".join(f"({round(p[0])},{round(p[1])})" for p in path)
+        corners = " ".join(f"{n}=({round(anchors[n][0])},{round(anchors[n][1])})" for n in per_stroke[i])
         lines.append(
             f"S{i}: start ({round(s[0][0])},{round(s[0][1])}) end ({round(s[-1][0])},{round(s[-1][1])}) "
-            f"bbox [{round(min(xs))},{round(min(ys))},{round(max(xs))},{round(max(ys))}] path {path_txt}"
+            f"bbox [{round(min(xs))},{round(min(ys))},{round(max(xs))},{round(max(ys))}] corners {corners} path {path_txt}"
         )
     if len(user_strokes) > max_strokes:
         lines.append(f"... and {len(user_strokes) - max_strokes} more strokes")
@@ -250,6 +293,7 @@ def snap_endpoints(new_strokes: list[Stroke], user_strokes: list[Stroke],
 def build_strokes(ai: dict, user_strokes: list[Stroke], log=None) -> list[Stroke]:
     """Everything the AI asked for, as strokes, with duplicates removed and ends snapped."""
     new, kinds, bad = [], {}, 0
+    _ANCHORS.set(anchor_points(user_strokes)[0])
     for shape in ai.get("shapes") or []:
         try:
             made = shape_to_strokes(shape, user_strokes, log)

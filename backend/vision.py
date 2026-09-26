@@ -85,8 +85,10 @@ How to pick the mode:
   "calculation": "SymPy-readable maths if the answer depends on a calculation, else null",
   "calc_guess": "your own result of that calculation"
 }
-- If there is a calculation, put {calc} in "answer" where the result goes; a solver fills it in.
-- Be a helpful tutor: if asked for a hint, give a hint rather than the whole solution.
+- If the question is about maths on the board ("what is x?", "solve it", "what's the answer?"),
+  copy that maths into "calculation" (e.g. "x^2+2*x+2=0") and write the answer as "x = {calc}".
+  A solver fills in the exact result, including complex answers. Actually answer the question.
+- Only give a hint instead of the answer when the person explicitly asks for a hint.
 
 3) DRAWING: a partial drawing or connect-the-dots
 {
@@ -113,8 +115,13 @@ Build the missing parts from these shapes (coordinates in grid pixels; angles in
          they are already there. "at" is the drawing's centre line.
 
 Rules for drawings:
-- You are also given the person's strokes as exact coordinates (S0, S1, ...). Use those exact
-  numbers to connect new parts to existing corners and line ends. Trust them over the picture.
+- You are also given the person's strokes as exact coordinates (S0, S1, ...) with their corners
+  named K0, K1, ... Trust these over the picture.
+- ANCHORS: anywhere a point [x, y] is expected you may write an anchor name instead:
+  "K7" (a named corner), or "S2.start", "S2.end", "S2.top", "S2.bottom", "S2.left", "S2.right", "S2.center".
+  Whenever a new line should touch the existing drawing, USE AN ANCHOR: it is exact, a guess is not.
+  Example roof on a box whose top corners are K0 and K3: {"type": "polyline", "points": ["K0", [600, 200], "K3"]}
+- Work out sizes from the existing parts (e.g. a door about 1/3 of the house width, centred on it).
 - Only add the NEW parts needed to finish it. Do not redraw existing lines.
 - Match the existing size, style and position, and stay inside the image.
 - Prefer the simplest shapes: a circle, not a polyline of 30 points. Keep it to about 30 shapes or fewer."""
@@ -223,10 +230,40 @@ def provider_name() -> str:
     return f"Claude {CLAUDE_MODEL}"
 
 
-def analyze_board(png_bytes: bytes, stroke_summary: str = "", strokes=None, mode: str = "auto") -> dict:
+ACTION_TEXT = {
+    "answer": "The person pressed ANSWER: they want the answer. Pick math, fill or answer (question) mode. "
+              "Do NOT pick drawing, even if the strokes look like letters or shapes.",
+    "hint": """The person pressed HINT. Do not give the final answer. Respond with:
+{"mode": "hint", "description": "what is on the board", "reasoning": "what the next step is and why",
+ "hint": "ONE short hint, max 15 words, that helps them take the next step without giving away the answer"}
+This works for maths, questions, patterns and drawings (e.g. "What do houses have on top?").""",
+    "check": """The person pressed CHECK MY WORK: they wrote problems AND their own answers. Respond with:
+{"mode": "check", "description": "what is on the board", "reasoning": "anything you were unsure reading",
+ "problems": [
+   {"expression": "5+4=10", "bbox": [x1, y1, x2, y2]},
+   {"equation": "2*x+3=7", "student_answer": "x=3", "bbox": [x1, y1, x2, y2]}
+ ]}
+- Arithmetic: "expression" is the whole line exactly as written, INCLUDING the student's answer.
+- Algebra: "equation" is the equation, "student_answer" is what they wrote as the solution (or null).
+- TRANSCRIBE EXACTLY what they wrote, even if it is wrong. Never fix their answer; a solver checks it.
+- "bbox" covers the problem and the student's answer. One entry per problem, top to bottom.""",
+}
+
+
+IMAGE_TEXT = ("The board also has an UPLOADED PICTURE (a worksheet, screenshot or photo) inside the box "
+              "x {0:.0f}-{2:.0f}, y {1:.0f}-{3:.0f}. Treat what is in the picture exactly like writing on the board: "
+              "solve, answer, hint or check the problems shown in it. Give every bbox in board pixels, around "
+              "where that problem appears inside the picture. If the picture has several problems, list each one.")
+
+
+def analyze_board(png_bytes: bytes, stroke_summary: str = "", strokes=None, mode: str = "auto",
+                  action: str = "", image_box=None) -> dict:
     gridded, w, h = add_grid(png_bytes, strokes)
     images = []
-    zoom = close_up(png_bytes, strokes)
+    focus = list(strokes or [])
+    if image_box:
+        focus.append([[image_box[0], image_box[1]], [image_box[2], image_box[3]]])
+    zoom = close_up(png_bytes, focus)
     if zoom:
         images.append(("IMAGE 1: an enlarged close-up of just the handwriting, with no grid. "
                        "Use this one to READ the characters and digits.", base64.b64encode(zoom).decode()))
@@ -236,6 +273,10 @@ def analyze_board(png_bytes: bytes, stroke_summary: str = "", strokes=None, mode
     user_text = f"The board is {w} x {h} pixels. Finish it."
     if mode in FORCED_MODE_TEXT:
         user_text += "\n\n" + FORCED_MODE_TEXT[mode]
+    if action in ACTION_TEXT:
+        user_text += "\n\n" + ACTION_TEXT[action]
+    if image_box:
+        user_text += "\n\n" + IMAGE_TEXT.format(*image_box)
     if stroke_summary:
         user_text += ("\n\nThe person's strokes, as exact coordinates "
                       "(start/end points, bounding box, and a sampled path):\n" + stroke_summary)
@@ -262,8 +303,9 @@ Respond with ONLY a JSON object, no markdown. One of:
   "calc_guess": "your own result of that calculation"
 }
 - When there is a calculation, write the answer with {calc} where the result goes,
-  e.g. "234 x 12 = {calc}". A solver fills in the exact result.
-- Be a helpful tutor: if asked for a hint, give a hint, not the full solution.
+  e.g. "234 x 12 = {calc}" or "x = {calc}". A solver fills in the exact result.
+  If the prompt asks about an equation on the board, copy that equation into "calculation".
+- Answer directly. Only give a hint instead of the answer when the person asks for a hint.
 
 or, if the prompt asks you to DRAW something:
 {
@@ -297,3 +339,36 @@ def ask(prompt: str, png_bytes: bytes, strokes, at, box) -> dict:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return _parse_json(_ask_claude(images, text, ASK_PROMPT))
     raise RuntimeError("No AI key set. Add OPENAI_API_KEY (or ANTHROPIC_API_KEY) to backend/.env")
+
+
+REVIEW_TEXT = """REVIEW PASS. Image 1 is the board with YOUR additions drawn in BLUE (the person's ink is black).
+Your previous answer was:
+{previous}
+
+Look carefully: do the blue parts connect to the black lines where they should, sit in the right place,
+have sensible sizes, and make the drawing look finished? Respond with ONLY JSON:
+- if it looks right: {{"mode": "drawing", "ok": true, "review": "one sentence"}}
+- if anything is off: {{"mode": "drawing", "ok": false, "review": "what was wrong", "plan": "...", "shapes": [ ...the FULL corrected list of shapes, replacing the old one... ]}}
+Use the same shape format and anchors as before."""
+
+
+def review_drawing(png_bytes: bytes, user_strokes, new_strokes, stroke_summary: str, previous: dict) -> dict:
+    """Show the AI its own result and let it fix mistakes once."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    d = ImageDraw.Draw(img)
+    for s in new_strokes:
+        if len(s) >= 2:
+            d.line([tuple(p) for p in s], fill=(31, 87, 195), width=5, joint="curve")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    gridded, w, h = add_grid(buf.getvalue(), user_strokes)
+    keep = {k: previous.get(k) for k in ("description", "plan", "shapes") if previous.get(k) is not None}
+    text = (REVIEW_TEXT.format(previous=json.dumps(keep)[:6000])
+            + "\n\nThe person's strokes, as exact coordinates with named corners:\n" + stroke_summary)
+    images = [(f"IMAGE 1: the board ({w} x {h} px) with your additions in blue, grid and stroke labels.",
+               base64.b64encode(gridded).decode())]
+    if os.environ.get("OPENAI_API_KEY"):
+        return _parse_json(_ask_openai(images, text))
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return _parse_json(_ask_claude(images, text))
+    raise RuntimeError("No AI key set.")

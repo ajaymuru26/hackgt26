@@ -13,7 +13,7 @@
   <main class="wall">
     <header class="top">
       <h1>Whiteboard Finisher</h1>
-      <p class="hint">Start a drawing or write a math problem like <strong>12 + 7 =</strong>, then press Finish it.</p>
+      <p class="hint">Write a problem like <strong>12 + 7 =</strong> or start a drawing, then pick what the robot should do.</p>
     </header>
 
     <div class="workspace">
@@ -34,16 +34,12 @@
         <button id="textBtn" class="tool" aria-pressed="false" title="Ask (T): click the board, type a prompt, the robot writes the answer">
           <span class="cap cap-text" aria-hidden="true">?</span>Ask
         </button>
+        <button id="imageBtn" class="tool" title="Upload a picture of a problem for the robot to solve">
+          <span class="cap cap-image" aria-hidden="true"></span>Image
+        </button>
+        <input id="imageInput" type="file" accept="image/*" hidden>
         <button id="undoBtn" class="tool" title="Undo (Ctrl+Z)">Undo</button>
         <button id="clearBtn" class="tool" title="Clear the board">Clear</button>
-      </div>
-
-      <div class="modes" role="radiogroup" aria-label="What should the robot do">
-        <span class="modes-label">Mode</span>
-        <button class="mode is-on" data-mode="auto" role="radio" aria-checked="true" title="Let the AI decide">Auto</button>
-        <button class="mode" data-mode="math" role="radio" aria-checked="false" title="Solve math">Math</button>
-        <button class="mode" data-mode="fill" role="radio" aria-checked="false" title="Continue a number pattern">Pattern</button>
-        <button class="mode" data-mode="drawing" role="radio" aria-checked="false" title="Finish a drawing">Drawing</button>
       </div>
 
       <p id="status" class="status" role="status" aria-live="polite"></p>
@@ -63,7 +59,25 @@
           <option value="50" selected>Medium</option>
           <option value="80">Large</option>
         </select>
-        <span class="writer-hint">Pick Ask, click the board, type a prompt, press Enter.</span>
+
+      </div>
+
+      <div class="action-group" role="group" aria-label="What should the robot do">
+        <button class="action finish" data-action="answer" title="Solve the maths, answer the question, or continue the pattern">
+          <span class="cap cap-blue" aria-hidden="true"></span><span class="action-label">Answer</span>
+        </button>
+        <button class="action" data-action="hint" title="A nudge toward the next step, without the answer">
+          <span class="action-label">Hint</span>
+        </button>
+        <button class="action" data-action="check" title="Mark your answers right or wrong">
+          <span class="action-label">Check my work</span>
+        </button>
+        <button class="action" data-action="drawing" title="Finish the picture on the board">
+          <span class="action-label">Finish drawing</span>
+        </button>
+        <label class="review-toggle" title="The AI looks at its own drawing once and fixes mistakes (a few seconds slower)">
+          <input id="reviewToggle" type="checkbox" checked> Double-check drawings
+        </label>
       </div>
 
       <div class="actions">
@@ -77,9 +91,6 @@
         </label>
         <button id="replayBtn" class="tool" disabled title="Watch the robot draw again">Replay</button>
         <button id="gcodeBtn" class="tool" disabled title="Download the robot's lines as G-code">Download G-code</button>
-        <button id="finishBtn" class="finish">
-          <span class="cap cap-blue" aria-hidden="true"></span><span id="finishLabel">Finish it</span>
-        </button>
       </div>
     </div>
     </div>

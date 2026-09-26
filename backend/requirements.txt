@@ -6,3 +6,5 @@ sympy
 openai
 python-dotenv
 Hershey-Fonts
+opencv-python-headless
+numpy

@@ -21,11 +21,11 @@ let strokes = [];       // { owner: "user" | "robot", points: [[x, y], ...] }
 let history = [];       // snapshots for undo
 let current = null;     // stroke being drawn
 let tool = "pen";
-let boardMode = "auto"; // auto | math | fill | drawing
 let busy = false;
 let lastRobotStrokes = [];
 let robot = null;       // live simulator state while the robot is drawing
 let lastRobotObjs = [];  // stroke objects the robot added last time (for replay)
+let background = null;  // uploaded picture shown faintly under the ink: { img, x, y, w, h }
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -58,10 +58,15 @@ function drawStroke(c, s) {
 
 function render() {
   ctx.clearRect(0, 0, W, H);
+  if (background) {
+    ctx.save();
+    ctx.drawImage(background.img, background.x, background.y, background.w, background.h);
+    ctx.restore();
+  }
   strokes.forEach((s) => drawStroke(ctx, s));
   if (current) drawStroke(ctx, current);
   if (robot) drawRobot(ctx);
-  $("empty").hidden = strokes.length > 0 || !!current;
+  $("empty").hidden = strokes.length > 0 || !!current || !!background;
 }
 
 function toBoard(e) {
@@ -135,27 +140,17 @@ function undo() {
   render();
 }
 
-document.querySelectorAll(".mode").forEach((btn) => {
-  btn.onclick = () => {
-    boardMode = btn.dataset.mode;
-    document.querySelectorAll(".mode").forEach((b) => {
-      const on = b === btn;
-      b.classList.toggle("is-on", on);
-      b.setAttribute("aria-checked", on);
-    });
-  };
-});
-
 $("penBtn").onclick = () => setTool("pen");
 $("eraserBtn").onclick = () => setTool("eraser");
 $("textBtn").onclick = () => setTool("text");
 $("undoBtn").onclick = undo;
 $("clearBtn").onclick = () => {
-  if (busy || !strokes.length) return;
+  if (busy || (!strokes.length && !background)) return;
   saveHistory();
   strokes = [];
   lastRobotStrokes = [];
   lastRobotObjs = [];
+  background = null;
   $("gcodeBtn").disabled = true;
   $("replayBtn").disabled = true;
   setStatus("");
@@ -178,10 +173,11 @@ function setStatus(text, kind = "") {
 
 function setBusy(on) {
   busy = on;
-  $("finishBtn").disabled = on;
-  $("finishBtn").classList.toggle("is-busy", on);
-  $("finishLabel").textContent = on ? "Finishing…" : "Finish it";
-  ["undoBtn", "clearBtn", "textBtn"].forEach((id) => ($(id).disabled = on));
+  document.querySelectorAll(".action").forEach((b) => {
+    b.disabled = on;
+    if (!on) b.classList.remove("is-busy");
+  });
+  ["undoBtn", "clearBtn", "textBtn", "imageBtn"].forEach((id) => ($(id).disabled = on));
   ["gcodeBtn", "replayBtn"].forEach((id) => ($(id).disabled = on || !lastRobotStrokes.length));
 }
 
@@ -193,6 +189,7 @@ function snapshot() {
   const c = off.getContext("2d");
   c.fillStyle = "#ffffff";
   c.fillRect(0, 0, W, H);
+  if (background) c.drawImage(background.img, background.x, background.y, background.w, background.h);
   strokes.forEach((s) => drawStroke(c, { ...s, owner: "user" }));
   return off.toDataURL("image/png");
 }
@@ -242,12 +239,16 @@ async function showThoughts(steps) {
   }
 }
 
-$("finishBtn").onclick = async () => {
+const ACTION_WORDS = { answer: "Working out the answer", hint: "Thinking of a hint",
+                       check: "Checking your work", drawing: "Looking at your drawing" };
+
+async function runAction(action, button) {
   if (busy) return;
-  if (!strokes.length) { setStatus("The board is empty. Draw something first.", "error"); return; }
+  if (!strokes.length && !background) { setStatus("The board is empty. Write, draw, or add an image first.", "error"); return; }
 
   setBusy(true);
-  setStatus("Looking at the board…");
+  button.classList.add("is-busy");
+  setStatus(`${ACTION_WORDS[action] || "Looking at the board"}…`);
   clearThoughts();
   const live = addThought("Thinking", "Sending the board to the AI… 0.0 s", "live");
   const t0 = performance.now();
@@ -259,7 +260,9 @@ $("finishBtn").onclick = async () => {
     const res = await fetch("/api/complete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: snapshot(), width: W, height: H, mode: boardMode,
+      body: JSON.stringify({ image: snapshot(), width: W, height: H, action, review: $("reviewToggle").checked,
+                             image_box: background ? [background.x, background.y, background.x + background.w,
+                                                      background.y + background.h] : null,
                              strokes: strokes.map((s) => s.points) }),
     });
     const data = await res.json().catch(() => ({}));
@@ -269,11 +272,13 @@ $("finishBtn").onclick = async () => {
     showProblemType(data.category);
     await showThoughts(data.steps);
 
-    const label = data.mode === "math"
-      ? `Read ${data.expression} and wrote ${data.answer}`
-      : data.mode === "fill"
-        ? `${data.description || "Next up"}: wrote ${data.answer}`
-        : `Finishing ${data.description || "the drawing"}`;
+    const label = {
+      math: `Read ${data.expression} and wrote ${data.answer}`,
+      fill: `${data.description || "Next up"}: wrote ${data.answer}`,
+      answer: `Answered: ${data.answer}`,
+      hint: data.answer,
+      check: `Checked your work: ${data.answer}`,
+    }[data.mode] || `Finishing ${data.description || "the drawing"}`;
     setStatus(label, "robot");
 
     saveHistory();
@@ -282,7 +287,7 @@ $("finishBtn").onclick = async () => {
     await animateRobot(data.strokes);
     drawing.classList.remove("is-live");
     drawing.querySelector(".thought-title").textContent = "Done";
-    drawing.querySelector(".thought-detail").textContent = "Finished drawing. Press Replay to watch again.";
+    drawing.querySelector(".thought-detail").textContent = "Finished. Press Replay to watch again.";
     setStatus(data.mode !== "drawing" ? label : `Finished ${data.description || "the drawing"}`, "robot");
   } catch (err) {
     clearInterval(ticker);
@@ -293,6 +298,10 @@ $("finishBtn").onclick = async () => {
     setBusy(false);
   }
 };
+
+document.querySelectorAll(".action").forEach((btn) => {
+  btn.addEventListener("click", () => runAction(btn.dataset.action, btn));
+});
 
 // ---------- Text tool: click the board and type ----------
 let textBox = null; // the live input on the board
@@ -402,6 +411,44 @@ async function writeAt([x, y], job) {
     setBusy(false);
   }
 }
+
+// ---------- Image: upload a picture, the robot draws over it ----------
+function loadImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Couldn't read that file."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("That file isn't an image I can open."));
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function placeImage(file) {
+  if (busy) return;
+  try {
+    const img = await loadImage(file);
+    // top of the board, leaving room underneath for the robot's answers
+    const maxW = W - 80, maxH = Math.round(H * 0.62);
+    const scale = Math.min(maxW / img.width, maxH / img.height);
+    const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+    background = { img, x: 40, y: 30, w, h };
+    render();
+    runAction("answer", document.querySelector('.action[data-action="answer"]'));
+  } catch (err) {
+    setStatus(err.message, "error");
+  }
+}
+
+$("imageBtn").onclick = () => $("imageInput").click();
+$("imageInput").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  e.target.value = ""; // lets you pick the same file again
+  if (file) placeImage(file);
+});
 
 // ---------- robot simulator ----------
 // Same greedy ordering as backend/gcode.py, so the simulation matches the real robot's path.

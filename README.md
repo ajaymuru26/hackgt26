@@ -1,46 +1,86 @@
 # Whiteboard Finisher
 
-Draw on a web whiteboard, press **Finish it**, and the backend completes it:
-math problems get solved and the answer is written in, partial drawings get finished.
-The robot's lines animate in blue, and **Download G-code** exports them for a pen plotter.
+Draw on the whiteboard and press **Finish it**. The app can solve handwritten math,
+continue a pattern, finish a drawing, or answer a handwritten question. It can also
+write a prompt or text on the board. Generated pen strokes animate in blue, and
+**Download G-code** exports them for a pen plotter.
 
 ## Run it
 
+From the repository root, create a virtual environment, install the backend
+dependencies, and configure an AI provider key:
+
 ```bash
 cd backend
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY=sk-ant-...        # Windows: set ANTHROPIC_API_KEY=sk-ant-...
-uvicorn main:app --reload
-
-cd backend
-python3 -m uvicorn main:app --reload
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
+
+Edit `backend/.env` and replace the placeholder with a real API key. The app uses
+OpenAI when `OPENAI_API_KEY` is set; otherwise it uses Claude when
+`ANTHROPIC_API_KEY` is set. Keep the key private and do not commit `.env`.
+
+To use Claude instead, put this in `backend/.env`:
+
+```dotenv
+ANTHROPIC_API_KEY=your-anthropic-api-key
+```
+
+Start the server from the `backend` directory:
+
+```bash
+python -m uvicorn main:app --reload
+```
+
+On Windows, activate the environment with `.venv\Scripts\activate` instead of
+`source .venv/bin/activate`.
 
 Open http://localhost:8000
 
-Optional: `export CLAUDE_MODEL=claude-opus-5-5` to try a stronger model (default is `claude-sonnet-5`).
+Optional model settings can also go in `backend/.env`:
 
-## Files
+```dotenv
+OPENAI_MODEL=gpt-4o
+CLAUDE_MODEL=claude-sonnet-5
+```
 
-- `frontend/app.js`: canvas whiteboard (1200x700 logical coords), records strokes, sends PNG + strokes, animates the reply
-- `backend/main.py`: `POST /api/complete` and `POST /api/gcode`, also serves the frontend
-- `backend/vision.py`: adds a labeled grid to the image, asks Claude what it sees, returns JSON
-- `backend/math_solver.py`: SymPy solves the equation so the answer is exact
-- `backend/handwriting.py`: single-line stroke font that writes the answer as pen strokes
-- `backend/gcode.py`: orders strokes to reduce travel, converts pixels to mm, outputs G-code
+The defaults are `gpt-4o` and `claude-sonnet-5`, respectively.
 
-## Math it handles
+## Features
 
-- `12+7=` writes `19` after the =
-- `2x+3=7` writes `x=2` underneath
-- `x^2-5x+6=0` writes `x=2,3`
-- `2+2=4` writes a check mark
-- `1/3+1/6=` writes `1/2`
+- **Auto, Math, Pattern, and Drawing modes:** choose a mode or let the AI classify the board.
+- **Ask tool:** click the board and enter a question or drawing instruction; the response is written there.
+- **Write text:** choose print or cursive style and a size.
+- **Thought process:** see the interpretation, calculations, and planned robot strokes.
+- **Undo, clear, replay, and speed controls** for editing and previewing the output.
+- **G-code export** for pen plotters.
+
+Math is computed with SymPy rather than relying on the AI to calculate the result. For example:
+
+- `12+7=` writes `19` after the equals sign.
+- `2x+3=7` writes `x=2` underneath.
+- `x^2-5x+6=0` writes `x=2,3`.
+- `2+2=4` writes a check mark.
+- `1/3+1/6=` writes `1/2`.
+
+## Backend map
+
+- `backend/main.py`: FastAPI routes, request validation, and response assembly. Also serves the frontend.
+- `backend/vision.py`: prepares board images and stroke coordinates for the AI provider.
+- `backend/math_solver.py`: parses and solves math with SymPy.
+- `backend/shapes.py`: converts AI-described shapes into strokes and snaps them to the user's drawing.
+- `backend/handwriting.py` and `backend/text_writer.py`: convert answers and text into plotter strokes.
+- `backend/gcode.py`: orders strokes, converts pixels to millimetres, and generates G-code.
+- `frontend/app.js`: records and submits strokes, then animates the backend response.
+
+The main API routes are `POST /api/complete`, `POST /api/ask`, `POST /api/write`, and
+`POST /api/gcode`.
 
 ## Hooking up the robot
 
-Edit `PEN_UP` / `PEN_DOWN` in `gcode.py` for your pen lift (servo or Z axis), and set
-`board_width_mm` / `board_height_mm` in the `/api/gcode` request to your drawing area.
-Send the file with a G-code sender (UGS, CNCjs) or pyserial. For a real whiteboard,
-replace the canvas snapshot with a camera photo flattened with a homography; everything
-else stays the same.
+Edit `PEN_UP` and `PEN_DOWN` in `backend/gcode.py` for your pen-lift hardware (servo or
+Z axis). Set `board_width_mm` and `board_height_mm` in the `/api/gcode` request to match
+the plotter's drawing area. Send the downloaded file with a G-code sender such as UGS or
+CNCjs. The current frontend uses a 1200 x 700 logical-pixel canvas.
