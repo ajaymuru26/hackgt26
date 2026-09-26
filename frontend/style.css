@@ -1,0 +1,405 @@
+:root {
+  --wall: #dde4ea;
+  --wall-ink: #3b4652;
+  --frame-light: #d3d9de;
+  --frame-dark: #9aa3ab;
+  --board: #fcfdfd;
+  --marker-black: #1c2230;
+  --marker-blue: #1f57c3;
+  --marker-red: #c8342b;
+  --tray: #c4cbd1;
+  --font: "Atkinson Hyperlegible", "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; height: 100%; }
+
+body {
+  background: var(--wall);
+  color: var(--wall-ink);
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.45;
+}
+
+.wall {
+  /* keep the whole board and tray visible without scrolling on laptop screens */
+  max-width: max(560px, min(1600px, calc((100vh - 250px) * 12 / 7 + 68px + 340px)));
+  margin: 0 auto;
+  padding: 20px 20px 32px;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 18px;
+  margin-bottom: 14px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--marker-black);
+  letter-spacing: -0.01em;
+}
+
+.hint { margin: 0; max-width: 62ch; }
+
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 20px;
+  align-items: start;
+}
+
+.stage { min-width: 0; }
+
+/* Thought process panel: a sheet of paper pinned beside the board */
+.thoughts {
+  background: #fff;
+  border: 1px solid rgba(28, 34, 48, 0.12);
+  border-radius: 8px;
+  padding: 16px 16px 8px;
+  box-shadow: 0 6px 16px rgba(40, 55, 70, 0.12);
+  max-height: calc(100vh - 110px);
+  overflow-y: auto;
+}
+
+.thoughts-head {
+  position: sticky;
+  top: -16px;
+  padding: 16px 0 4px;
+  margin: -16px 0 6px;
+  background: #fff;
+  z-index: 1;
+}
+
+.thoughts h2 {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+  color: var(--marker-black);
+}
+
+.problem-type {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #e5edfb;
+  color: #173f8f;
+}
+.problem-type[hidden] { display: none; }
+.problem-type strong { font-size: 1.05rem; }
+.problem-type[data-type="Algebra"] { background: #ece8fb; color: #3c2f8f; }
+.problem-type[data-type="Fill in the blank"] { background: #e1f3ec; color: #0c5a44; }
+.problem-type[data-type="Number pattern"] { background: #fbf0dc; color: #6b4608; }
+.problem-type[data-type="Drawing"] { background: #fbe9e4; color: #7a2c16; }
+
+.thoughts-empty { margin: 0 0 8px; color: #6b7682; }
+.thoughts-empty[hidden] { display: none; }
+
+.thought-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: step;
+}
+
+.thought {
+  position: relative;
+  padding: 0 0 12px 34px;
+  counter-increment: step;
+  animation: appear 0.25s ease-out;
+}
+
+.thought::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #e5edfb;
+  color: var(--marker-blue);
+  font-size: 0.8rem;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+.thought:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: 10.5px;
+  top: 26px;
+  bottom: 4px;
+  width: 1px;
+  background: #d5dce4;
+}
+
+.thought-title { margin: 0; font-weight: 700; color: var(--marker-black); }
+.thought-detail { margin: 2px 0 0; color: #3b4652; overflow-wrap: anywhere; }
+
+.thought.is-live .thought-title::after { content: " …"; }
+.thought.is-error::before { background: #fbe4e2; color: var(--marker-red); content: "!"; }
+.thought.is-error .thought-title { color: var(--marker-red); }
+
+@keyframes appear { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .thought { animation: none; }
+}
+
+@media (max-width: 1000px) {
+  .workspace { grid-template-columns: 1fr; }
+  .thoughts { max-height: none; }
+}
+
+/* The board: brushed aluminum frame around a white surface */
+.frame {
+  position: relative;
+  padding: 14px;
+  border-radius: 6px;
+  background: linear-gradient(160deg, var(--frame-light), var(--frame-dark));
+  box-shadow: 0 1px 0 #fff inset, 0 10px 24px rgba(40, 55, 70, 0.18);
+}
+
+#board {
+  display: block;
+  width: 100%;
+  aspect-ratio: 12 / 7;
+  background: var(--board);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.08) inset;
+  touch-action: none;
+  cursor: crosshair;
+}
+
+#board.erasing { cursor: cell; }
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  font-size: 1.25rem;
+  color: #b4bcc4;
+  pointer-events: none;
+}
+
+.empty[hidden] { display: none; }
+
+/* The marker tray under the board holds every control */
+.tray {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  margin: 0 18px;
+  padding: 10px 14px;
+  background: linear-gradient(var(--tray), #aeb6bd);
+  border-radius: 0 0 8px 8px;
+  box-shadow: 0 6px 12px rgba(40, 55, 70, 0.15);
+}
+
+.tools, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.status {
+  flex: 1 1 220px;
+  margin: 0;
+  min-height: 1.45em;
+  color: var(--marker-black);
+}
+
+.status.is-error { color: var(--marker-red); }
+.status.is-robot { color: var(--marker-blue); }
+
+button {
+  font: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid rgba(28, 34, 48, 0.25);
+  border-radius: 6px;
+  background: #eef1f3;
+  color: var(--marker-black);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: #fff; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+button:focus-visible {
+  outline: 3px solid var(--marker-blue);
+  outline-offset: 2px;
+}
+
+.writer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex-basis: 100%;
+}
+
+.writer-label { color: var(--marker-black); }
+
+.writer input {
+  font: inherit;
+  flex: 1 1 220px;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid rgba(28, 34, 48, 0.25);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--marker-black);
+}
+
+.writer input:focus-visible {
+  outline: 3px solid var(--marker-blue);
+  outline-offset: 2px;
+}
+
+#board.texting { cursor: text; }
+
+.writer-hint { color: #4b5663; font-size: 0.95rem; }
+
+.cap-text {
+  width: auto;
+  height: auto;
+  font-weight: 700;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--marker-blue);
+}
+
+/* The text box that appears on the board where you click */
+.board-input {
+  position: absolute;
+  z-index: 2;
+  min-width: 120px;
+  padding: 0 4px;
+  border: 2px dashed var(--marker-blue);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.85);
+  color: var(--marker-blue);
+  font-family: var(--font);
+  line-height: 1.1;
+  outline: none;
+}
+
+.problem-type[data-type="Text"] { background: #eceef1; color: #2b333f; }
+.problem-type[data-type="Answer"] { background: #e3f1f7; color: #0d4a63; }
+.problem-type[data-type="Question"] { background: #e3f1f7; color: #0d4a63; }
+.problem-type[data-type="Pattern"] { background: #fbf0dc; color: #6b4608; }
+
+.speed {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--marker-black);
+}
+
+select {
+  font: inherit;
+  padding: 7px 8px;
+  border: 1px solid rgba(28, 34, 48, 0.25);
+  border-radius: 6px;
+  background: #eef1f3;
+  color: var(--marker-black);
+}
+
+select:focus-visible {
+  outline: 3px solid var(--marker-blue);
+  outline-offset: 2px;
+}
+
+.modes {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+}
+
+.modes-label { margin-right: 8px; color: var(--marker-black); }
+
+.mode {
+  border-radius: 0;
+  margin-left: -1px;
+  padding: 8px 12px;
+}
+
+.mode:first-of-type { border-radius: 6px 0 0 6px; }
+.mode:last-of-type { border-radius: 0 6px 6px 0; }
+
+.mode.is-on {
+  background: var(--marker-blue);
+  border-color: var(--marker-blue);
+  color: #fff;
+  position: relative;
+}
+
+.tool.is-on {
+  background: #fff;
+  border-color: var(--marker-black);
+  box-shadow: 0 0 0 1px var(--marker-black) inset;
+}
+
+.finish {
+  background: var(--marker-blue);
+  border-color: var(--marker-blue);
+  color: #fff;
+  font-weight: 700;
+  padding: 8px 18px;
+}
+
+.finish:hover:not(:disabled) { background: #194aa8; }
+
+/* Little marker caps as tool icons */
+.cap {
+  width: 10px;
+  height: 18px;
+  border-radius: 3px 3px 2px 2px;
+  flex: none;
+}
+.cap-black { background: var(--marker-black); }
+.cap-blue { background: #fff; box-shadow: 0 0 0 2px #fff; }
+.finish .cap-blue { background: #cfe0ff; box-shadow: none; }
+.cap-eraser {
+  width: 16px;
+  height: 12px;
+  background: linear-gradient(#5b6470 45%, #e9e2d4 45%);
+  border-radius: 2px;
+}
+
+.finish.is-busy .cap-blue { animation: bob 0.6s ease-in-out infinite alternate; }
+
+@keyframes bob { from { transform: translateY(-2px); } to { transform: translateY(2px); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .finish.is-busy .cap-blue { animation: none; }
+}
+
+@media (max-width: 640px) {
+  .wall { padding: 12px 10px 24px; }
+  .frame { padding: 8px; }
+  .tray { margin: 0 8px; }
+  .actions { width: 100%; }
+  .finish { flex: 1; justify-content: center; }
+}
+
+.frame:has(.board-input) .empty { display: none; }
+
+.board-input.is-waiting {
+  border-style: solid;
+  color: var(--marker-black);
+  background: rgba(255, 255, 255, 0.6);
+}

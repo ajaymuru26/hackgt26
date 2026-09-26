@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+anthropic
+pillow
+sympy
+openai
+python-dotenv
+Hershey-Fonts

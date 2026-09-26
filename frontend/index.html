@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Whiteboard Finisher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wall">
+    <header class="top">
+      <h1>Whiteboard Finisher</h1>
+      <p class="hint">Start a drawing or write a math problem like <strong>12 + 7 =</strong>, then press Finish it.</p>
+    </header>
+
+    <div class="workspace">
+    <div class="stage">
+    <div class="frame">
+      <canvas id="board" aria-label="Whiteboard drawing area"></canvas>
+      <p id="empty" class="empty">Draw here</p>
+    </div>
+
+    <div class="tray" role="toolbar" aria-label="Whiteboard tools">
+      <div class="tools">
+        <button id="penBtn" class="tool is-on" aria-pressed="true" title="Marker (P)">
+          <span class="cap cap-black" aria-hidden="true"></span>Marker
+        </button>
+        <button id="eraserBtn" class="tool" aria-pressed="false" title="Eraser (E)">
+          <span class="cap cap-eraser" aria-hidden="true"></span>Eraser
+        </button>
+        <button id="textBtn" class="tool" aria-pressed="false" title="Ask (T): click the board, type a prompt, the robot writes the answer">
+          <span class="cap cap-text" aria-hidden="true">?</span>Ask
+        </button>
+        <button id="undoBtn" class="tool" title="Undo (Ctrl+Z)">Undo</button>
+        <button id="clearBtn" class="tool" title="Clear the board">Clear</button>
+      </div>
+
+      <div class="modes" role="radiogroup" aria-label="What should the robot do">
+        <span class="modes-label">Mode</span>
+        <button class="mode is-on" data-mode="auto" role="radio" aria-checked="true" title="Let the AI decide">Auto</button>
+        <button class="mode" data-mode="math" role="radio" aria-checked="false" title="Solve math">Math</button>
+        <button class="mode" data-mode="fill" role="radio" aria-checked="false" title="Continue a number pattern">Pattern</button>
+        <button class="mode" data-mode="drawing" role="radio" aria-checked="false" title="Finish a drawing">Drawing</button>
+      </div>
+
+      <p id="status" class="status" role="status" aria-live="polite"></p>
+
+      <div class="writer">
+        <span class="writer-label">Ask tool:</span>
+        <select id="askMode" aria-label="What the robot does with your prompt">
+          <option value="answer" selected>Answer my prompt</option>
+          <option value="exact">Write exactly what I type</option>
+        </select>
+        <select id="writeStyle" aria-label="Writing style">
+          <option value="print">Print</option>
+          <option value="cursive">Cursive</option>
+        </select>
+        <select id="writeSize" aria-label="Text size">
+          <option value="30">Small</option>
+          <option value="50" selected>Medium</option>
+          <option value="80">Large</option>
+        </select>
+        <span class="writer-hint">Pick Ask, click the board, type a prompt, press Enter.</span>
+      </div>
+
+      <div class="actions">
+        <label class="speed" for="speedSelect">Robot speed
+          <select id="speedSelect">
+            <option value="1">Real</option>
+            <option value="2">2x</option>
+            <option value="4" selected>4x</option>
+            <option value="10">10x</option>
+          </select>
+        </label>
+        <button id="replayBtn" class="tool" disabled title="Watch the robot draw again">Replay</button>
+        <button id="gcodeBtn" class="tool" disabled title="Download the robot's lines as G-code">Download G-code</button>
+        <button id="finishBtn" class="finish">
+          <span class="cap cap-blue" aria-hidden="true"></span><span id="finishLabel">Finish it</span>
+        </button>
+      </div>
+    </div>
+    </div>
+
+    <aside class="thoughts" aria-labelledby="thoughtsTitle">
+      <div class="thoughts-head">
+        <h2 id="thoughtsTitle">Thought process</h2>
+        <p id="problemType" class="problem-type" hidden></p>
+      </div>
+      <p id="thoughtsEmpty" class="thoughts-empty">Press Finish it and the robot will explain each step it takes here.</p>
+      <ol id="thoughtList" class="thought-list"></ol>
+    </aside>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
