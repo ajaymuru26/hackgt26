@@ -145,7 +145,7 @@ h1 {
 }
 
 .thought-title { margin: 0; font-weight: 700; color: var(--marker-black); }
-.thought-detail { margin: 2px 0 0; color: #3b4652; overflow-wrap: anywhere; }
+.thought-detail { margin: 2px 0 0; color: #3b4652; overflow-wrap: anywhere; white-space: pre-line; }
 
 .thought.is-live .thought-title::after { content: " …"; }
 .thought.is-error::before { background: #fbe4e2; color: var(--marker-red); content: "!"; }
@@ -211,6 +211,34 @@ h1 {
 }
 
 .tools, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.saved {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.saved-label { margin: 0; color: var(--marker-black); }
+
+.saved-empty { margin: 0; color: var(--marker-black); }
+
+.saved-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.saved-list button {
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .status {
   flex: 1 1 220px;
@@ -312,6 +340,8 @@ button:focus-visible {
 .problem-type[data-type="Question"] { background: #e3f1f7; color: #0d4a63; }
 .problem-type[data-type="Pattern"] { background: #fbf0dc; color: #6b4608; }
 
+.model-switch { flex-basis: 100%; }
+
 .action-group {
   display: flex;
   flex-wrap: wrap;
@@ -390,6 +420,13 @@ select:focus-visible {
   background: #fff;
   border-color: var(--marker-black);
   box-shadow: 0 0 0 1px var(--marker-black) inset;
+}
+
+#talkBtn.is-on {
+  background: var(--marker-red);
+  border-color: var(--marker-red);
+  color: #fff;
+  box-shadow: none;
 }
 
 .finish {

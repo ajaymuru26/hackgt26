@@ -5,6 +5,8 @@ pillow
 sympy
 openai
 python-dotenv
+certifi
+pymongo
 Hershey-Fonts
 opencv-python-headless
 numpy

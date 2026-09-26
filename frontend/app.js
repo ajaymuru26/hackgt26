@@ -27,6 +27,7 @@ let robot = null;       // live simulator state while the robot is drawing
 let lastRobotObjs = [];  // stroke objects the robot added last time (for replay)
 let background = null;  // uploaded picture under the sketch and the answer: { img, x, y, w, h }
 let timedFrom = 0;      // start of an image run, so the status can show total time
+let provider = "openai"; // openai | gemini, set by the Model buttons
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -61,8 +62,9 @@ function drawStroke(c, s) {
     if (traceStroke(c, pts) === "fill") c.fill();
     else c.stroke();
   }
-  c.strokeStyle = COLORS[s.owner];
-  c.fillStyle = COLORS[s.owner];
+  const ink = s.highlight ? "#159447" : COLORS[s.owner];
+  c.strokeStyle = ink;
+  c.fillStyle = ink;
   c.lineWidth = LINE_WIDTH;
   if (traceStroke(c, pts) === "fill") c.fill();
   else c.stroke();
@@ -189,7 +191,7 @@ function setBusy(on) {
     b.disabled = on;
     if (!on) b.classList.remove("is-busy");
   });
-  ["undoBtn", "clearBtn", "textBtn", "imageBtn"].forEach((id) => ($(id).disabled = on));
+  ["undoBtn", "clearBtn", "textBtn", "imageBtn", "talkBtn"].forEach((id) => ($(id).disabled = on));
   ["gcodeBtn", "replayBtn"].forEach((id) => ($(id).disabled = on || !lastRobotStrokes.length));
 }
 
@@ -205,7 +207,7 @@ function snapshot() {
   // The photo stays on screen underneath.
   const sketched = strokes.some((s) => s.owner === "user");
   if (background && !sketched) c.drawImage(background.img, background.x, background.y, background.w, background.h);
-  strokes.forEach((s) => drawStroke(c, { ...s, owner: "user" }));
+  strokes.forEach((s) => drawStroke(c, { ...s, owner: "user", highlight: false }));
   return off.toDataURL("image/png");
 }
 
@@ -254,8 +256,10 @@ async function showThoughts(steps) {
   }
 }
 
-const ACTION_WORDS = { answer: "Working out the answer", hint: "Thinking of a hint",
-                       check: "Checking your work", drawing: "Looking at your drawing" };
+const ACTION_WORDS = { answer: "Working out the answer", work: "Working out the steps",
+                       hint: "Thinking of a hint",
+                       check: "Checking your work", drawing: "Looking at your drawing",
+                       cv: "Reading the ink with computer vision" };
 
 async function runAction(action, button) {
   if (busy) return;
@@ -265,12 +269,13 @@ async function runAction(action, button) {
   button.classList.add("is-busy");
   setStatus(`${ACTION_WORDS[action] || "Looking at the board"}…`);
   clearThoughts();
-  const live = addThought("Thinking", "Sending the board to the AI… 0.0 s", "live");
+  const thinking = action === "cv" ? "Reading the ink with computer vision" : "Sending the board to the AI";
+  const live = addThought("Thinking", `${thinking}… 0.0 s`, "live");
   const t0 = timedFrom || performance.now();
   timedFrom = 0;
   const ticker = setInterval(() => {
     live.querySelector(".thought-detail").textContent =
-      `Sending the board to the AI… ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+      `${thinking}… ${((performance.now() - t0) / 1000).toFixed(1)} s`;
   }, 100);
   try {
     const res = await fetch("/api/complete", {
@@ -278,7 +283,8 @@ async function runAction(action, button) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ image: snapshot(), width: W, height: H, action, review: $("reviewToggle").checked,
                              image_box: strokes.some((s) => s.owner === "user") ? null : imageBox(),
-                             strokes: strokes.map((s) => s.points) }),
+                             strokes: strokes.map((s) => s.points), provider,
+                             instruction: action === "drawing" ? $("drawingNote").value.trim() : "" }),
     });
     const data = await res.json().catch(() => ({}));
     clearInterval(ticker);
@@ -294,11 +300,17 @@ async function runAction(action, button) {
       hint: data.answer,
       check: `Checked your work: ${data.answer}`,
     }[data.mode] || `Finishing ${data.description || "the drawing"}`;
+    const checkNote = data.checks ? ` · ${data.checks} check${data.checks === 1 ? "" : "s"}` : "";
     const runtime = ((performance.now() - t0) / 1000).toFixed(1);
-    setStatus(`${label} · ${runtime} s`, "robot");
+    setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
     addThought("Runtime", `${runtime} s`);
+    noteSaved(data);
 
     saveHistory();
+    (data.highlight || []).forEach((i) => {
+      if (strokes[i] && strokes[i].owner === "user") strokes[i].highlight = true;
+    });
+    render();
     lastRobotStrokes = data.strokes;
     const drawing = addThought("Drawing", "The robot is drawing it on the board now.", "live");
     await animateRobot(data.strokes);
@@ -309,7 +321,7 @@ async function runAction(action, button) {
     const runtimeThought = [...document.querySelectorAll(".thought")].find((el) => el.querySelector(".thought-title")?.textContent === "Runtime");
     if (runtimeThought) runtimeThought.querySelector(".thought-detail").textContent = `${total} s`;
     const finished = data.mode !== "drawing" ? label : `Finished ${data.description || "the drawing"}`;
-    setStatus(`${finished} · ${total} s`, "robot");
+    setStatus(`${finished}${checkNote} · ${total} s`, "robot");
   } catch (err) {
     clearInterval(ticker);
     live.remove();
@@ -399,7 +411,7 @@ async function writeAt([x, y], job) {
   try {
     const body = asking
       ? { prompt: job.text, image: snapshot(), strokes: strokes.map((s) => s.points),
-          x, y, size: job.size, style: job.style, width: W, height: H }
+          x, y, size: job.size, style: job.style, width: W, height: H, provider }
       : { text: job.text, x, y, size: job.size, style: job.style, width: W, height: H };
     const res = await fetch(asking ? "/api/ask" : "/api/write", {
       method: "POST",
@@ -417,6 +429,7 @@ async function writeAt([x, y], job) {
     await showThoughts(data.steps);
     lastRobotStrokes = data.strokes;
     setStatus(data.mode === "drawing" ? `Drawing ${data.description}` : data.answer ? `Writing: ${data.answer}` : "Writing", "robot");
+    noteSaved(data);
     const drawing = addThought(data.mode === "drawing" ? "Drawing" : "Writing", "The robot is on the board now.", "live");
     await animateRobot(data.strokes);
     drawing.classList.remove("is-live");
@@ -505,7 +518,215 @@ async function placeImage(file) {
   }
 }
 
+function setProvider(name) {
+  provider = name;
+  $("openaiBtn").classList.toggle("is-on", name === "openai");
+  $("geminiBtn").classList.toggle("is-on", name === "gemini");
+  $("openaiBtn").setAttribute("aria-pressed", String(name === "openai"));
+  $("geminiBtn").setAttribute("aria-pressed", String(name === "gemini"));
+  setStatus(name === "gemini" ? "Using Gemini" : "Using OpenAI", "robot");
+}
+
+$("drawingNote").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  const button = document.querySelector('.action[data-action="drawing"]');
+  runAction("drawing", button);
+});
+
+$("openaiBtn").onclick = () => setProvider("openai");
+$("geminiBtn").onclick = () => setProvider("gemini");
+
 $("imageBtn").onclick = () => $("imageInput").click();
+
+let recorder = null;
+let recordChunks = [];
+let recordTimer = 0;
+let heardLive = "";
+let hearThought = null;
+let speechRec = null;
+let captionTimer = 0;
+let captionBusy = false;
+
+function showHeard(text) {
+  const shown = text.replace(/\s+/g, " ").trim();
+  if (!shown) return;
+  heardLive = shown;
+  setStatus(shown, "robot");
+  if (!hearThought) hearThought = addThought("Hearing", shown, "live");
+  else hearThought.querySelector(".thought-detail").textContent = shown;
+}
+
+function startChunkedCaption() {
+  clearInterval(captionTimer);
+  captionTimer = setInterval(sendPartialCaption, 1000);
+}
+
+function stopChunkedCaption() {
+  clearInterval(captionTimer);
+  captionTimer = 0;
+}
+
+async function sendPartialCaption() {
+  if (captionBusy || !recorder || recorder.state !== "recording" || !recordChunks.length) return;
+  const type = recorder.mimeType || "audio/webm";
+  const blob = new Blob(recordChunks, { type });
+  if (blob.size < 2000) return;
+  captionBusy = true;
+  try {
+    const audio = await blobToDataUrl(blob);
+    const res = await fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audio, mime: type }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.text && recorder && recorder.state === "recording") showHeard(data.text);
+  } catch {
+    // The next tick tries again. Stop still sends the full recording.
+  } finally {
+    captionBusy = false;
+  }
+}
+
+function startLiveCaption() {
+  heardLive = "";
+  hearThought = null;
+  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Rec) {
+    startChunkedCaption();
+    return;
+  }
+  const rec = new Rec();
+  speechRec = rec;
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = "en-US";
+  rec.onresult = (event) => {
+    let text = "";
+    for (let i = 0; i < event.results.length; i++) text += event.results[i][0].transcript;
+    showHeard(text);
+  };
+  rec.onerror = () => {
+    if (!heardLive) startChunkedCaption();
+  };
+  try {
+    rec.start();
+  } catch {
+    speechRec = null;
+    startChunkedCaption();
+  }
+}
+
+function stopLiveCaption() {
+  if (speechRec) {
+    speechRec.onresult = null;
+    speechRec.onerror = null;
+    try { speechRec.stop(); } catch { /* already stopped */ }
+    speechRec = null;
+  }
+  stopChunkedCaption();
+}
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Couldn't read the recording."));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function finishTalk(blob, mime) {
+  setBusy(true);
+  $("talkBtn").classList.remove("is-on");
+  $("talkBtn").setAttribute("aria-pressed", "false");
+  $("talkBtn").textContent = "Talk";
+  const said = heardLive;
+  clearThoughts();
+  hearThought = null;
+  if (said) addThought("You said", said);
+  setStatus(said ? `Heard: ${said}` : "Turning your voice into a drawing…");
+  const live = addThought("Thinking", said ? "Drawing what you said… 0.0 s" : "ElevenLabs is listening… 0.0 s", "live");
+  const t0 = performance.now();
+  const ticker = setInterval(() => {
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    live.querySelector(".thought-detail").textContent =
+      said ? `Drawing what you said… ${secs} s` : `ElevenLabs is listening… ${secs} s`;
+  }, 100);
+  try {
+    const audio = await blobToDataUrl(blob);
+    const res = await fetch("/api/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        audio, mime, text: said, image: snapshot(), strokes: strokes.map((s) => s.points),
+        width: W, height: H, provider,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    clearInterval(ticker);
+    live.remove();
+    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+    saveHistory();
+    render();
+    showProblemType(data.category);
+    await showThoughts(data.steps);
+    lastRobotStrokes = data.strokes;
+    noteSaved(data);
+    const drawing = addThought("Drawing", "The robot is drawing what you said.", "live");
+    await animateRobot(data.strokes);
+    drawing.classList.remove("is-live");
+    drawing.querySelector(".thought-title").textContent = "Done";
+    drawing.querySelector(".thought-detail").textContent = "Finished. Press Replay to watch again.";
+    setStatus(data.mode === "drawing" ? `Drew ${data.description}` : `Wrote: ${data.answer}`, "robot");
+  } catch (err) {
+    clearInterval(ticker);
+    live.remove();
+    setStatus(err.message, "error");
+    addThought("Something went wrong", err.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+$("talkBtn").onclick = async () => {
+  if (busy) return;
+  if (recorder && recorder.state === "recording") {
+    recorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("This browser can't use the microphone.", "error");
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    recordChunks = [];
+    recorder.ondataavailable = (e) => { if (e.data.size) recordChunks.push(e.data); };
+    recorder.onstop = () => {
+      clearTimeout(recordTimer);
+      stopLiveCaption();
+      stream.getTracks().forEach((track) => track.stop());
+      const type = recorder.mimeType || "audio/webm";
+      const blob = new Blob(recordChunks, { type });
+      finishTalk(blob, type);
+    };
+    recorder.start(400);
+    clearThoughts();
+    startLiveCaption();
+    $("talkBtn").classList.add("is-on");
+    $("talkBtn").setAttribute("aria-pressed", "true");
+    $("talkBtn").textContent = "Stop";
+    setStatus("Listening…", "robot");
+    recordTimer = setTimeout(() => { if (recorder && recorder.state === "recording") recorder.stop(); }, 20000);
+  } catch (err) {
+    setStatus(err.name === "NotAllowedError" ? "Allow the microphone, then click Talk again." : err.message, "error");
+  }
+};
+
 $("imageInput").addEventListener("change", (e) => {
   const file = e.target.files[0];
   e.target.value = ""; // lets you pick the same file again
@@ -739,5 +960,67 @@ $("gcodeBtn").onclick = async () => {
   }
 };
 
+function noteSaved(data) {
+  if (!data.board_id) return;
+  addThought("Saved", "Stored this board in MongoDB Atlas.");
+  loadSaved();
+}
+
+async function loadSaved() {
+  const list = $("savedList");
+  const empty = $("savedEmpty");
+  try {
+    const res = await fetch("/api/boards");
+    const data = await res.json().catch(() => ({}));
+    const boards = data.boards || [];
+    list.replaceChildren();
+    if (!data.configured) {
+      empty.hidden = false;
+      empty.textContent = "Add MONGODB_URI to backend/.env to keep finished boards in Atlas.";
+      return;
+    }
+    empty.hidden = boards.length > 0;
+    empty.textContent = "Finished boards show up here.";
+    boards.forEach((board) => {
+      const item = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "tool";
+      const when = board.created ? new Date(board.created).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+      btn.textContent = board.label || board.mode || "Board";
+      btn.title = [when, board.seconds ? `${board.seconds} s` : ""].filter(Boolean).join(" · ");
+      btn.onclick = () => openSaved(board.id);
+      item.append(btn);
+      list.append(item);
+    });
+  } catch {
+    empty.hidden = false;
+    empty.textContent = "Couldn't load saved boards.";
+  }
+}
+
+async function openSaved(id) {
+  if (busy) return;
+  setBusy(true);
+  setStatus("Opening a saved board…");
+  try {
+    const res = await fetch(`/api/boards/${id}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+    background = null;
+    history = [];
+    strokes = (data.strokes || []).map((s) => ({ owner: s.owner === "robot" ? "robot" : "user", points: s.points }));
+    lastRobotObjs = strokes.filter((s) => s.owner === "robot");
+    lastRobotStrokes = lastRobotObjs.map((s) => s.points);
+    render();
+    setStatus(data.label ? `Opened ${data.label}` : "Opened a saved board", "robot");
+  } catch (err) {
+    setStatus(err.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
 window.addEventListener("resize", resize);
 resize();
+loadSaved();

@@ -8,12 +8,14 @@ import base64
 import io
 import json
 import os
+import re
 
 from PIL import Image, ImageDraw
 
-# Uses OpenAI if OPENAI_API_KEY is set, otherwise Claude (ANTHROPIC_API_KEY).
+# The board buttons pick OpenAI or Gemini. Claude is still available if you pass provider "claude".
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GRID_STEP = 100
 
 SYSTEM_PROMPT = """You are the brain of a robot that fills in the blanks on a whiteboard.
@@ -39,7 +41,9 @@ How to pick the mode:
   planet", "spell cat"), it is QUESTION: answer it. It is not a pattern and not a drawing.
 - PATTERN (fill) is only for sequences of items to continue, like "2, 4, 6," or "A, B, C,".
 - Every response, in every mode, must also include "math_reading": the strokes read as math
-  (e.g. "1+1"), or null if they truly cannot be read as math.
+  (e.g. "1+1"), or null if they truly cannot be read as math. When math_reading is not null,
+  also include "math_answer" (the solution you computed) and "math_kind"
+  ("evaluate", "solve", "blank", or "check").
 
 1) MATH: arithmetic or an equation (e.g. "5+4=", "12x3=", "5+_=9", "2x+3=7")
 {
@@ -47,13 +51,20 @@ How to pick the mode:
   "description": "short phrase describing what you see",
   "reasoning": "one or two sentences: how you read the handwriting and any characters you were unsure about",
   "problems": [
-    {"expression": "...", "bbox": [x1, y1, x2, y2], "blank_bbox": [x1, y1, x2, y2] or null}
+    {"expression": "...", "answer": "...", "kind": "evaluate", "bbox": [x1, y1, x2, y2], "blank_bbox": [x1, y1, x2, y2] or null}
   ]
 }
 - The board may have SEVERAL separate problems (different lines or spots). Give each one its own
   entry in "problems", top to bottom. Never join problems together with ";" or newlines.
-- "expression" is a TRANSCRIPTION of exactly what is written. NEVER add the answer yourself;
-  a separate solver computes it. If the board shows "5+4=" the expression is "5+4=", not "5+4=9".
+- "expression" is a TRANSCRIPTION of exactly what is written, without your solution.
+  If the board shows "5+4=" the expression is "5+4=", not "5+4=9".
+- YOU solve every problem. The answer you compute goes in "answer". Nothing else checks the maths.
+  Arithmetic: "19". Several roots: "x=2 or x=3", never "x=2,3" (that looks like one number).
+  A blank: the missing number only, such as "4".
+  A polynomial with no equals sign is an equation set to 0. Solve x^2-5x+6 as "x=2 or x=3".
+- "kind" is "evaluate" (write the result after the problem), "solve" (an equation, written underneath),
+  "blank" (the missing number goes in the blank), or "check" (both sides are already filled in;
+  answer is "✓" if they match and "✗" if they do not).
 - If a line ends with "=" and nothing after it, keep the trailing "=".
 - If the person left a blank (an underscore, an empty box, a "?" or a gap) replace it with _ ,
   e.g. "5+_=9" or "_x4=20", and give its location in "blank_bbox". Otherwise "blank_bbox" is null.
@@ -81,13 +92,10 @@ How to pick the mode:
   "description": "short phrase, e.g. 'a question about the sky'",
   "question": "the question as you read it",
   "reasoning": "one or two sentences on how you answered",
-  "answer": "a short answer to write under the question, max about 15 words, plain ASCII",
-  "calculation": "SymPy-readable maths if the answer depends on a calculation, else null",
-  "calc_guess": "your own result of that calculation"
+  "answer": "a short answer to write under the question, max about 15 words, plain ASCII"
 }
-- If the question is about maths on the board ("what is x?", "solve it", "what's the answer?"),
-  copy that maths into "calculation" (e.g. "x^2+2*x+2=0") and write the answer as "x = {calc}".
-  A solver fills in the exact result, including complex answers. Actually answer the question.
+- If the question is about maths, solve it yourself and put the finished result in "answer"
+  (for example "x = -1, 3"). Do not leave a blank or a placeholder for some other program to fill in.
 - Only give a hint instead of the answer when the person explicitly asks for a hint.
 
 3) DRAWING: a partial drawing or connect-the-dots
@@ -106,13 +114,13 @@ Build the missing parts from these shapes (coordinates in grid pixels; angles in
   {"type": "ellipse", "center": [x, y], "rx": rx, "ry": ry}
   {"type": "arc", "center": [x, y], "r": radius, "start": deg, "end": deg}   (or "rx"/"ry" instead of "r")
   {"type": "curve", "points": [start, control, end]}  or [start, control1, control2, end]  (Bezier)
-  {"type": "mirror", "strokes": ["S0", "S3"] or "all", "axis": "vertical", "at": x}
-      -> copies the person's own strokes, flipped across the line x = at ("horizontal" axis flips across y = at).
-         Use this when a drawing is symmetric and one side is missing (half a face, one wing,
-         one side of a house). It is pixel-perfect, so prefer it over redrawing that side.
-         List ONLY the strokes on the drawn side (red S labels in the picture show which is which).
-         Do not list strokes in the middle that cross the mirror line (eyes, nose, a centred mouth);
-         they are already there. "at" is the drawing's centre line.
+  {"type": "mirror", "strokes": ["S0", "S3"] or "all", "axis": "vertical"}
+      -> copies those exact strokes, flipped, and places the copy BESIDE them.
+         The fold is the right edge of those strokes, never the middle. The copy is placed
+         on the right of that edge, so a left half of a face gains its right side beside it.
+         Do not pass "at" and do not redraw the
+         other side yourself. List only the strokes that should be copied (one side of a face,
+         one wing). Those strokes are highlighted in green on the board.
 
 Rules for drawings:
 - You are also given the person's strokes as exact coordinates (S0, S1, ...) with their corners
@@ -120,7 +128,17 @@ Rules for drawings:
 - ANCHORS: anywhere a point [x, y] is expected you may write an anchor name instead:
   "K7" (a named corner), or "S2.start", "S2.end", "S2.top", "S2.bottom", "S2.left", "S2.right", "S2.center".
   Whenever a new line should touch the existing drawing, USE AN ANCHOR: it is exact, a guess is not.
-  Example roof on a box whose top corners are K0 and K3: {"type": "polyline", "points": ["K0", [600, 200], "K3"]}
+  Example roof on a box whose top corners are K0 and K3: {"type": "polyline", "points": ["K0", ["CX", "T-0.5*W"], "K3"]}
+- COORDINATES ARE COMPUTED, NOT GUESSED. A MEASURED FRAME is included with the strokes:
+  L T R B are the left, top, right, bottom of the ink; W H its width and height; CX CY its centre.
+  Corner names: TL TR BL BR. Edge midpoints: TC BC LC RC. Centre: C.
+  Use expressions of those names for every coordinate and every radius. Examples:
+  {"type": "roof"}  ends exactly on the top corners, peak exactly 0.5*W above the top edge
+  {"type": "door"}  width exactly W/3, height exactly H/2, centred, bottom flush with B
+  {"type": "window"}  side exactly W/5, centred in the upper part of the box
+  {"type": "circle", "center": ["CX+0.18*W", "T+0.38*H"], "r": "0.07*W"}  a second eye
+  Add "on": "S0" to measure from stroke S0 instead of the whole drawing.
+  A point looks like ["CX", "T+0.4*H"] or "L+W/3". "r", "rx", and "ry" can be expressions too.
 - Work out sizes from the existing parts (e.g. a door about 1/3 of the house width, centred on it).
 - Only add the NEW parts needed to finish it. Do not redraw existing lines.
 - Match the existing size, style and position, and stay inside the image.
@@ -175,6 +193,70 @@ def _ask_openai(images: list[tuple[str, str]], user_text: str, system: str = Non
         messages=[{"role": "system", "content": system or SYSTEM_PROMPT}, {"role": "user", "content": content}],
     )
     return response.choices[0].message.content
+
+
+def _gemini_models() -> list[str]:
+    """Preferred model first, then others to try when Google says it is too busy."""
+    fallbacks = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]
+    models = [GEMINI_MODEL]
+    for name in fallbacks:
+        if name not in models:
+            models.append(name)
+    return models
+
+
+def _ask_gemini(images: list[tuple[str, str]], user_text: str, system: str = None) -> str:
+    """images = [(caption, base64_png), ...]. Uses the Gemini REST API, no extra package."""
+    import ssl
+    import time
+    import urllib.error
+    import urllib.request
+
+    import certifi
+
+    key = os.environ.get("GEMINI_API_KEY", "")
+    parts = []
+    for caption, b64 in images:
+        parts.append({"text": caption})
+        parts.append({"inlineData": {"mimeType": "image/png", "data": b64}})
+    parts.append({"text": user_text})
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": system or SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+    }).encode()
+    context = ssl.create_default_context(cafile=certifi.where())
+    last_error = None
+    for model in _gemini_models():
+        request = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            data=body,
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+        )
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=90, context=context) as response:
+                    payload = json.loads(response.read().decode())
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode(errors="replace")[:400]
+                last_error = RuntimeError(f"Gemini request failed ({e.code}): {detail}")
+                if e.code in (429, 503) and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                if e.code in (429, 503):
+                    break
+                raise last_error from e
+            else:
+                _ask_gemini.last_model = model
+                candidates = payload.get("candidates") or []
+                if not candidates:
+                    reason = (payload.get("promptFeedback") or {}).get("blockReason") or "no response"
+                    raise RuntimeError(f"Gemini returned nothing ({reason}).")
+                texts = [p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []) if p.get("text")]
+                if not texts:
+                    raise RuntimeError("Gemini returned no text.")
+                return "".join(texts)
+    raise last_error or RuntimeError("Gemini is busy. Try again in a moment, or switch to OpenAI.")
 
 
 def _ask_claude(images: list[tuple[str, str]], user_text: str, system: str = None) -> str:
@@ -278,15 +360,44 @@ FORCED_MODE_TEXT = {
 }
 
 
-def provider_name() -> str:
-    if os.environ.get("OPENAI_API_KEY"):
-        return f"OpenAI {OPENAI_MODEL}"
-    return f"Claude {CLAUDE_MODEL}"
+def provider_name(provider: str = "openai") -> str:
+    name = (provider or "openai").lower()
+    if name == "gemini":
+        return f"Gemini {GEMINI_MODEL}"
+    if name == "claude":
+        return f"Claude {CLAUDE_MODEL}"
+    return f"OpenAI {OPENAI_MODEL}"
+
+
+def _dispatch(images, user_text, system, provider: str):
+    """Send the board to whichever model the buttons selected."""
+    name = (provider or "openai").lower()
+    if name == "gemini":
+        if not os.environ.get("GEMINI_API_KEY"):
+            raise RuntimeError("No Gemini key. Add GEMINI_API_KEY=... to backend/.env, save, and restart the server.")
+        return _parse_json(_ask_gemini(images, user_text, system))
+    if name == "claude":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("No Anthropic key. Add ANTHROPIC_API_KEY to backend/.env")
+        return _parse_json(_ask_claude(images, user_text, system))
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError("No OpenAI key. Add OPENAI_API_KEY to backend/.env")
+    return _parse_json(_ask_openai(images, user_text, system))
 
 
 ACTION_TEXT = {
     "answer": "The person pressed ANSWER: they want the answer. Pick math, fill or answer (question) mode. "
               "Do NOT pick drawing, even if the strokes look like letters or shapes.",
+    "work": """The person pressed ANSWER BUT SHOW WORK. They want the answer and the steps written on the board.
+Pick math, fill, or answer (question) mode. Do NOT pick drawing.
+For math, each problem still has expression, answer, kind, and bbox, and also:
+"work": "the steps, plain ASCII, one step per line, at most 5 lines. The last line is the final answer.
+Use * for multiply and ^ for powers. No markdown.
+Example:
+(x-2)(x-3)=0
+x=2 or x=3"
+For a written question, put those same steps in top-level "work" and the short final result in "answer".
+For a pattern, "work" is one line naming the rule, and "text" is still what to write next.""",
     "hint": """The person pressed HINT. Do not give the final answer. Respond with:
 {"mode": "hint", "description": "what is on the board", "reasoning": "what the next step is and why",
  "hint": "ONE short hint, max 15 words, that helps them take the next step without giving away the answer"}
@@ -299,7 +410,9 @@ This works for maths, questions, patterns and drawings (e.g. "What do houses hav
  ]}
 - Arithmetic: "expression" is the whole line exactly as written, INCLUDING the student's answer.
 - Algebra: "equation" is the equation, "student_answer" is what they wrote as the solution (or null).
-- TRANSCRIBE EXACTLY what they wrote, even if it is wrong. Never fix their answer; a solver checks it.
+- TRANSCRIBE EXACTLY what they wrote, even if it is wrong. Then YOU check it.
+  Add "correct": true, false, or null if they wrote no answer yet, and "correct_answer": the right result
+  as you compute it (e.g. "9" or "x=2").
 - "bbox" covers the problem and the student's answer. One entry per problem, top to bottom.""",
 }
 
@@ -313,7 +426,7 @@ IMAGE_TEXT = ("The whiteboard IS an uploaded picture filling x {0:.0f}-{2:.0f}, 
 
 
 def analyze_board(png_bytes: bytes, stroke_summary: str = "", strokes=None, mode: str = "auto",
-                  action: str = "", image_box=None) -> dict:
+                  action: str = "", image_box=None, provider: str = "openai", instruction: str = "") -> dict:
     gridded, w, h = add_grid(png_bytes, strokes)
     images = []
     focus = list(strokes or [])
@@ -333,15 +446,22 @@ def analyze_board(png_bytes: bytes, stroke_summary: str = "", strokes=None, mode
         user_text += "\n\n" + ACTION_TEXT[action]
     if image_box:
         user_text += "\n\n" + IMAGE_TEXT.format(*image_box)
+    if instruction and instruction.strip():
+        note = instruction.strip()[:400]
+        user_text += ("\n\nThe person typed this instruction for how to change the drawing. "
+                      "Follow it. Change only what they asked for, and still respond with mode \"drawing\". "
+                      "Place every new part with roof/door/window or with expressions of the MEASURED FRAME, "
+                      "not guessed pixels:\n" + note)
+        if re.search(r"reflect|mirror|both sides|other side", note, re.I):
+            user_text += ("\n\nThis is a reflection. Return one mirror shape and list only the strokes "
+                          "to copy. Do not draw the other side yourself and do not use the centre as the "
+                          "fold. The program highlights those strokes in green and places the flipped copy "
+                          "across the right edge, so the copy sits on the right of the original.")
     if stroke_summary:
         user_text += ("\n\nThe person's strokes, as exact coordinates "
                       "(start/end points, bounding box, and a sampled path):\n" + stroke_summary)
 
-    if os.environ.get("OPENAI_API_KEY"):
-        return _parse_json(_ask_openai(images, user_text))
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return _parse_json(_ask_claude(images, user_text))
-    raise RuntimeError("No AI key set. Run: export OPENAI_API_KEY=... (or ANTHROPIC_API_KEY=...)")
+    return _dispatch(images, user_text, None, provider)
 
 
 ASK_PROMPT = """You are a robot that writes on a real whiteboard with a marker.
@@ -354,13 +474,10 @@ Respond with ONLY a JSON object, no markdown. One of:
 {
   "kind": "text",
   "reasoning": "one or two sentences on how you answered",
-  "answer": "the text to write: short, max about 20 words, plain ASCII, no emoji or markdown",
-  "calculation": "if the answer depends on arithmetic or algebra, the maths as SymPy-readable text (e.g. 234*12 or 2*x+3=7), otherwise null",
-  "calc_guess": "your own result of that calculation"
+  "answer": "the text to write: short, max about 20 words, plain ASCII, no emoji or markdown"
 }
-- When there is a calculation, write the answer with {calc} where the result goes,
-  e.g. "234 x 12 = {calc}" or "x = {calc}". A solver fills in the exact result.
-  If the prompt asks about an equation on the board, copy that equation into "calculation".
+- If the prompt needs arithmetic or algebra, solve it yourself and put the finished numbers in "answer".
+  Do not leave a placeholder. Example: "234 x 12 = 2808" or "x = 2".
 - Answer directly. Only give a hint instead of the answer when the person asks for a hint.
 
 or, if the prompt asks you to DRAW something:
@@ -380,7 +497,39 @@ Shapes use board pixel coordinates (x right, y down), angles in degrees with 0 =
 Draw it inside the box you are given, simply, with at most about 30 shapes, and avoid existing ink."""
 
 
-def ask(prompt: str, png_bytes: bytes, strokes, at, box) -> dict:
+SPEAK_PROMPT = """You are a robot that draws on a real whiteboard with a marker.
+The person spoke out loud. Draw what they described.
+
+Respond with ONLY a JSON object, no markdown.
+
+If they described a picture, object, diagram, or said "draw":
+{
+  "kind": "drawing",
+  "description": "what you are drawing",
+  "shapes": [ ... ]
+}
+Shapes use board pixel coordinates (x right, y down), angles in degrees with 0 = right, 90 = down:
+  {"type": "line", "from": [x, y], "to": [x, y]}
+  {"type": "polyline", "points": [[x, y], ...], "closed": false}
+  {"type": "rect", "x": left, "y": top, "w": width, "h": height}
+  {"type": "circle", "center": [x, y], "r": radius}
+  {"type": "ellipse", "center": [x, y], "rx": rx, "ry": ry}
+  {"type": "arc", "center": [x, y], "r": radius, "start": deg, "end": deg}
+  {"type": "curve", "points": [start, control, end]}
+Draw it inside the box you are given, simply, with at most about 30 shapes, and avoid existing ink.
+A spoken request is a drawing unless they clearly asked a question or for a calculation.
+
+If they asked a question or for maths ("1 + 1", "do 1 + 1", "what is 12 plus 7"), respond with:
+{
+  "kind": "text",
+  "reasoning": "one or two sentences",
+  "problem": "the problem restated as it should be written on the board, plain ASCII, no markdown. Arithmetic ends with =, e.g. \\"1 + 1 =\\". A question is the question itself.",
+  "answer": "only the result to write on the next line, short plain ASCII, not a repeat of the problem"
+}
+Numbers and sums are text, not drawings."""
+
+
+def ask(prompt: str, png_bytes: bytes, strokes, at, box, provider: str = "openai", system: str = None) -> dict:
     gridded, w, h = add_grid(png_bytes, strokes)
     images = []
     zoom = close_up(png_bytes, strokes)
@@ -390,26 +539,78 @@ def ask(prompt: str, png_bytes: bytes, strokes, at, box) -> dict:
     images.append((f"The full board ({w} x {h} px) with a coordinate grid:", base64.b64encode(gridded).decode()))
     text = (f"PROMPT: {prompt}\n\nThe answer will be written starting at ({at[0]:.0f}, {at[1]:.0f}). "
             f"If you draw, stay inside the box x {box[0]:.0f}-{box[2]:.0f}, y {box[1]:.0f}-{box[3]:.0f}.")
-    if os.environ.get("OPENAI_API_KEY"):
-        return _parse_json(_ask_openai(images, text, ASK_PROMPT))
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return _parse_json(_ask_claude(images, text, ASK_PROMPT))
-    raise RuntimeError("No AI key set. Add OPENAI_API_KEY (or ANTHROPIC_API_KEY) to backend/.env")
+    return _dispatch(images, text, system or ASK_PROMPT, provider)
 
 
-REVIEW_TEXT = """REVIEW PASS. Image 1 is the board with YOUR additions drawn in BLUE (the person's ink is black).
-Your previous answer was:
+def transcribe(audio: bytes, mime: str = "audio/webm") -> str:
+    """Turn a short recording into text with ElevenLabs speech-to-text."""
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    import certifi
+
+    key = os.environ.get("ELEVENLABS_API_KEY", "")
+    if not key:
+        raise RuntimeError("No ElevenLabs key. Add ELEVENLABS_API_KEY to backend/.env and restart the server.")
+    kind = (mime or "audio/webm").split(";", 1)[0].strip().lower()
+    ext = {"audio/webm": "webm", "audio/mp4": "mp4", "audio/mpeg": "mp3", "audio/wav": "wav", "audio/ogg": "ogg"}.get(kind, "webm")
+    model = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v2")
+    boundary = "----whiteboard-speech"
+    head = (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"model_id\"\r\n\r\n{model}\r\n"
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.{ext}\"\r\n"
+        f"Content-Type: {kind}\r\n\r\n"
+    ).encode()
+    body = head + audio + f"\r\n--{boundary}--\r\n".encode()
+    request = urllib.request.Request(
+        "https://api.elevenlabs.io/v1/speech-to-text",
+        data=body,
+        headers={"xi-api-key": key, "Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    context = ssl.create_default_context(cafile=certifi.where())
+    try:
+        with urllib.request.urlopen(request, timeout=60, context=context) as response:
+            payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        if e.code in (401, 403):
+            raise RuntimeError("ElevenLabs rejected the key. Check ELEVENLABS_API_KEY in backend/.env.") from e
+        raise RuntimeError(f"ElevenLabs couldn't transcribe that ({e.code}): {detail}") from e
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("I didn't catch any words. Try speaking a bit louder and closer.")
+    return text[:500]
+
+
+REVIEW_TEXT = """The drawing is finished. Image 1 shows it: YOUR additions are BLUE, the person's ink is black.
+If you see no blue ink, the first attempt added nothing. That is not ok.
+This is check {check} of {limit}. Your previous answer was:
 {previous}
 
-Look carefully: do the blue parts connect to the black lines where they should, sit in the right place,
-have sensible sizes, and make the drawing look finished? Respond with ONLY JSON:
-- if it looks right: {{"mode": "drawing", "ok": true, "review": "one sentence"}}
-- if anything is off: {{"mode": "drawing", "ok": false, "review": "what was wrong", "plan": "...", "shapes": [ ...the FULL corrected list of shapes, replacing the old one... ]}}
-Use the same shape format and anchors as before."""
+Go through this checklist in order. Answer every item. "pass" is true only when that item is fully true.
+1. Missing parts — every part named in the plan is drawn in blue.
+2. Placement — each new part is on the correct side of the drawing, not through the middle of it.
+3. Size — each new part matches the scale of the ink already there.
+4. Connection — new parts meet the existing lines where they should, and do not float.
+5. No duplicate — blue ink does not trace over what the person already drew.
+
+"ok" is true only when all five pass and blue ink is on the board. Otherwise "ok" is false and "shapes" is the full corrected drawing.
+Respond with ONLY JSON:
+{{"mode": "drawing", "ok": false, "review": "one sentence", "checklist": [
+  {{"item": "Missing parts", "pass": false, "note": "what you see"}},
+  {{"item": "Placement", "pass": true, "note": "what you see"}},
+  {{"item": "Size", "pass": true, "note": "what you see"}},
+  {{"item": "Connection", "pass": true, "note": "what you see"}},
+  {{"item": "No duplicate", "pass": true, "note": "what you see"}}
+], "plan": "what you will change", "shapes": [ ...the FULL corrected list, or [] if ok is true... ]}}
+Use the same shape format and anchors as before.
+Judge it against the plan. A copy of the whole drawing is only ok when the plan was to reflect one side."""
 
 
-def review_drawing(png_bytes: bytes, user_strokes, new_strokes, stroke_summary: str, previous: dict) -> dict:
-    """Show the AI its own result and let it fix mistakes once."""
+def review_drawing(png_bytes: bytes, user_strokes, new_strokes, stroke_summary: str, previous: dict,
+                   provider: str = "openai", check: int = 1, limit: int = 3) -> dict:
+    """Show the AI its own result so it can accept it or say what to change."""
     img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     d = ImageDraw.Draw(img)
     for s in new_strokes:
@@ -419,12 +620,8 @@ def review_drawing(png_bytes: bytes, user_strokes, new_strokes, stroke_summary: 
     img.save(buf, format="PNG")
     gridded, w, h = add_grid(buf.getvalue(), user_strokes)
     keep = {k: previous.get(k) for k in ("description", "plan", "shapes") if previous.get(k) is not None}
-    text = (REVIEW_TEXT.format(previous=json.dumps(keep)[:6000])
+    text = (REVIEW_TEXT.format(previous=json.dumps(keep)[:6000], check=check, limit=limit)
             + "\n\nThe person's strokes, as exact coordinates with named corners:\n" + stroke_summary)
     images = [(f"IMAGE 1: the board ({w} x {h} px) with your additions in blue, grid and stroke labels.",
                base64.b64encode(gridded).decode())]
-    if os.environ.get("OPENAI_API_KEY"):
-        return _parse_json(_ask_openai(images, text))
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return _parse_json(_ask_claude(images, text))
-    raise RuntimeError("No AI key set.")
+    return _dispatch(images, text, None, provider)
