@@ -83,3 +83,24 @@ Edit `PEN_UP` and `PEN_DOWN` in `backend/gcode.py` for your pen-lift hardware (s
 Z axis). Set `board_width_mm` and `board_height_mm` in the `/api/gcode` request to match
 the plotter's drawing area. Send the downloaded file with a G-code sender such as UGS or
 CNCjs. The current frontend uses a 1200 x 700 logical-pixel canvas.
+
+### Drawing from the app
+
+The **Robot** bar under the board streams the robot's latest lines straight to the Nano
+(flashed with the GRBL in `firmware/`, see `firmware/README.md`):
+
+1. Plug in the Nano, pick its COM port (or **Simulator** to test without hardware), and
+   press **Connect**. Close the Arduino Serial Monitor first: only one program can use the port.
+2. Get an answer on the board, then press **Send to robot**. **Pause**, **Stop** (lifts the
+   pen) and **Pen down/up** (to test the servo) are next to it.
+
+Set the plotter's drawing area in `backend/.env` once the frame is built:
+
+```dotenv
+BOARD_WIDTH_MM=800
+BOARD_HEIGHT_MM=500
+```
+
+`backend/robot.py` does the streaming: it sends one line at a time and waits for GRBL's
+`ok`, polling GRBL's status for the pen position. The Nano works with no motors attached,
+so the software can be tested before the hardware is built.

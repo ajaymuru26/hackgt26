@@ -10,3 +10,5 @@ pymongo
 Hershey-Fonts
 opencv-python-headless
 numpy
+pyserial
+
