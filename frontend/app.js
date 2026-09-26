@@ -80,6 +80,7 @@ function render() {
   strokes.forEach((s) => drawStroke(ctx, s));
   if (current) drawStroke(ctx, current);
   if (robot) drawRobot(ctx);
+  drawMachine();
   $("empty").hidden = strokes.length > 0 || !!current || !!background;
 }
 
@@ -203,10 +204,8 @@ function snapshot() {
   const c = off.getContext("2d");
   c.fillStyle = "#ffffff";
   c.fillRect(0, 0, W, H);
-  // Once the picture has been traced, the model sees the sketch on white, same as a drawing.
-  // The photo stays on screen underneath.
-  const sketched = strokes.some((s) => s.owner === "user");
-  if (background && !sketched) c.drawImage(background.img, background.x, background.y, background.w, background.h);
+  // The whole uploaded photo goes to the model. A close-up of the trace was cutting off the problem.
+  if (background) c.drawImage(background.img, background.x, background.y, background.w, background.h);
   strokes.forEach((s) => drawStroke(c, { ...s, owner: "user", highlight: false }));
   return off.toDataURL("image/png");
 }
@@ -259,9 +258,21 @@ async function showThoughts(steps) {
 const ACTION_WORDS = { answer: "Working out the answer", work: "Working out the steps",
                        hint: "Thinking of a hint",
                        check: "Checking your work", drawing: "Looking at your drawing",
-                       cv: "Reading the ink with computer vision" };
+                       cv: "Reading the ink with computer vision",
+                       auto: "Reading the picture" };
 
-async function runAction(action, button) {
+function placeAnswer(newStrokes) {
+  lastRobotObjs = [];
+  (newStrokes || []).forEach((pts) => {
+    const obj = { owner: "robot", points: pts };
+    strokes.push(obj);
+    lastRobotObjs.push(obj);
+  });
+  lastRobotStrokes = newStrokes || [];
+  render();
+}
+
+async function runAction(action, button, opts = {}) {
   if (busy) return;
   if (!strokes.length && !background) { setStatus("The board is empty. Write, draw, or add an image first.", "error"); return; }
 
@@ -278,11 +289,19 @@ async function runAction(action, button) {
       `${thinking}… ${((performance.now() - t0) / 1000).toFixed(1)} s`;
   }, 100);
   try {
+    // Read the photo before the marker ink is drawn on top of it.
+    const image = snapshot();
+    if (action === "answer" && background && !background.marked) {
+      const ink = await markerInk(image);
+      ink.forEach((pts) => strokes.push({ owner: "user", points: pts }));
+      background.marked = true;
+      if (ink.length) render();
+    }
     const res = await fetch("/api/complete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: snapshot(), width: W, height: H, action, review: $("reviewToggle").checked,
-                             image_box: strokes.some((s) => s.owner === "user") ? null : imageBox(),
+      body: JSON.stringify({ image, width: W, height: H, action, review: opts.instant ? false : $("reviewToggle").checked,
+                             image_box: background ? imageBox() : null,
                              strokes: strokes.map((s) => s.points), provider,
                              instruction: action === "drawing" ? $("drawingNote").value.trim() : "" }),
     });
@@ -290,8 +309,9 @@ async function runAction(action, button) {
     clearInterval(ticker);
     live.remove();
     if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+    // Clock stops when the answer is about to be written, not after the pen finishes.
+    const runtime = ((performance.now() - t0) / 1000).toFixed(1);
     showProblemType(data.category);
-    await showThoughts(data.steps);
 
     const label = {
       math: `Read ${data.expression} and wrote ${data.answer}`,
@@ -301,27 +321,32 @@ async function runAction(action, button) {
       check: `Checked your work: ${data.answer}`,
     }[data.mode] || `Finishing ${data.description || "the drawing"}`;
     const checkNote = data.checks ? ` · ${data.checks} check${data.checks === 1 ? "" : "s"}` : "";
-    const runtime = ((performance.now() - t0) / 1000).toFixed(1);
-    setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
-    addThought("Runtime", `${runtime} s`);
-    noteSaved(data);
-
     saveHistory();
     (data.highlight || []).forEach((i) => {
       if (strokes[i] && strokes[i].owner === "user") strokes[i].highlight = true;
     });
+    if (opts.instant) {
+      placeAnswer(data.strokes);
+      (data.steps || []).forEach((s) => addThought(s.title, s.detail));
+      addThought("Runtime", `${runtime} s until writing`);
+      noteSaved(data);
+      setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
+      await animateRobot(data.strokes, { ink: false, record: false });
+      return;
+    }
+    await showThoughts(data.steps);
+    setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
+    addThought("Runtime", `${runtime} s until writing`);
+    noteSaved(data);
     render();
     lastRobotStrokes = data.strokes;
     const drawing = addThought("Drawing", "The robot is drawing it on the board now.", "live");
     await animateRobot(data.strokes);
     drawing.classList.remove("is-live");
-    const total = ((performance.now() - t0) / 1000).toFixed(1);
     drawing.querySelector(".thought-title").textContent = "Done";
-    drawing.querySelector(".thought-detail").textContent = `Finished in ${total} s. Press Replay to watch again.`;
-    const runtimeThought = [...document.querySelectorAll(".thought")].find((el) => el.querySelector(".thought-title")?.textContent === "Runtime");
-    if (runtimeThought) runtimeThought.querySelector(".thought-detail").textContent = `${total} s`;
+    drawing.querySelector(".thought-detail").textContent = "Finished. Press Replay to watch again.";
     const finished = data.mode !== "drawing" ? label : `Finished ${data.description || "the drawing"}`;
-    setStatus(`${finished}${checkNote} · ${total} s`, "robot");
+    setStatus(`${finished}${checkNote} · ${runtime} s`, "robot");
   } catch (err) {
     clearInterval(ticker);
     live.remove();
@@ -333,7 +358,14 @@ async function runAction(action, button) {
 };
 
 document.querySelectorAll(".action").forEach((btn) => {
-  btn.addEventListener("click", () => runAction(btn.dataset.action, btn));
+  btn.addEventListener("click", () => {
+    if (btn.dataset.action === "cv" && background) {
+      cropShown();
+      return;
+    }
+    // A photo is already the marker. Write the answer on it at once.
+    runAction(btn.dataset.action, btn, background ? { instant: true } : {});
+  });
 });
 
 // ---------- Text tool: click the board and type ----------
@@ -448,6 +480,15 @@ async function writeAt([x, y], job) {
 
 // ---------- Image: upload a picture, the robot draws over it ----------
 function loadImage(file) {
+  // Bake in the phone's rotation, then draw that bitmap. Otherwise a portrait photo
+  // is treated as landscape and the board shows a cropped slice.
+  if (typeof createImageBitmap === "function") {
+    return createImageBitmap(file, { imageOrientation: "from-image" }).catch(() => loadImageElement(file));
+  }
+  return loadImageElement(file);
+}
+
+function loadImageElement(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("Couldn't read that file."));
@@ -461,7 +502,7 @@ function loadImage(file) {
   });
 }
 
-// Visible area of the uploaded picture, in board pixels. Cover can extend past the edges.
+// Visible area of the uploaded picture, in board pixels. The whole photo fits on the board.
 function imageBox() {
   if (!background) return null;
   return [
@@ -472,49 +513,87 @@ function imageBox() {
   ];
 }
 
-async function placeImage(file) {
-  if (busy) return;
-  const button = document.querySelector('.action[data-action="answer"]');
-  timedFrom = performance.now();
-  setBusy(true);
-  setStatus("Turning the image into a sketch…");
+function imageFromUrl(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Couldn't open that picture."));
+    img.src = url;
+  });
+}
+
+async function markerInk(image) {
   try {
-    const img = await loadImage(file);
-    // Cover the board, then trace the ink into pen strokes — the same input a drawing uses.
-    const scale = Math.max(W / img.width, H / img.height);
-    const w = img.width * scale, h = img.height * scale;
-    const off = document.createElement("canvas");
-    off.width = W;
-    off.height = H;
-    const c = off.getContext("2d");
-    c.fillStyle = "#ffffff";
-    c.fillRect(0, 0, W, H);
-    c.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
     const res = await fetch("/api/trace", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image: off.toDataURL("image/png"), x: 0, y: 0, w: W, h: H, detail: "high", width: W, height: H,
-      }),
+      body: JSON.stringify({ image, x: 0, y: 0, w: W, h: H, detail: "marker", width: W, height: H }),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
-    // Drop a frame around the whole photo so it isn't treated as part of the problem.
-    const sketched = (data.strokes || []).filter((pts) => {
+    if (!res.ok) return [];
+    return (data.strokes || []).filter((pts) => {
+      if (!pts || pts.length < 2) return false;
       const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
       return (Math.max(...xs) - Math.min(...xs)) < W * 0.9 || (Math.max(...ys) - Math.min(...ys)) < H * 0.9;
     });
-    if (!sketched.length) throw new Error("Couldn't find any writing in that image.");
+  } catch {
+    return [];
+  }
+}
+
+async function cropShown() {
+  if (busy || !background || !background.source) return;
+  setBusy(true);
+  clearThoughts();
+  setStatus("Cropping to the whiteboard…");
+  try {
+    const res = await fetch("/api/crop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: background.source }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+    if (!data.cropped || !data.image) {
+      setStatus("Couldn't find a whiteboard in that picture. The whole photo stays up.", "error");
+      return;
+    }
+    const img = await imageFromUrl(data.image);
     saveHistory();
-    background = { img, x: (W - w) / 2, y: (H - h) / 2, w, h };
-    sketched.forEach((pts) => strokes.push({ owner: "user", points: pts }));
+    strokes = [];
+    lastRobotStrokes = [];
+    lastRobotObjs = [];
+    background = { img, x: 0, y: 0, w: W, h: H, source: background.source };
     render();
-    setBusy(false);
-    runAction("answer", button);
+    setStatus("Showing only the whiteboard. Press Answer when you want it solved.", "robot");
   } catch (err) {
-    timedFrom = 0;
-    setBusy(false);
     setStatus(err.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function placeImage(file) {
+  if (busy) return;
+  setBusy(true);
+  clearThoughts();
+  setStatus("Putting the picture on the board…");
+  try {
+    const source = await blobToDataUrl(file);
+    const img = await loadImage(file);
+    // The picture fills the board. CV crops it down to the whiteboard.
+    saveHistory();
+    strokes = [];
+    lastRobotStrokes = [];
+    lastRobotObjs = [];
+    background = { img, x: 0, y: 0, w: W, h: H, source };
+    timedFrom = 0;
+    render();
+    setStatus("Picture is on the board. Press CV finish to crop to the whiteboard.", "robot");
+  } catch (err) {
+    setStatus(err.message, "error");
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -772,6 +851,122 @@ function speedMultiplier() {
   return Number($("speedSelect").value) || 4;
 }
 
+const MARKER_MM = 8;
+
+function axisSpeeds() {
+  const preview = speedMultiplier();
+  return {
+    x: (Number($("speedX").value) || 120) * preview,
+    y: (Number($("speedY").value) || 80) * preview,
+    z: (Number($("speedZ").value) || 40) * preview,
+  };
+}
+
+function moveSeconds(from, to) {
+  const [x1, y1] = toMM(from);
+  const [x2, y2] = toMM(to);
+  const speeds = axisSpeeds();
+  return Math.max(Math.abs(x2 - x1) / speeds.x, Math.abs(y2 - y1) / speeds.y);
+}
+
+let machineTrail = [];
+
+function logMachine(text) {
+  const list = $("machineLog");
+  if (!list) return;
+  const li = document.createElement("li");
+  li.textContent = text;
+  list.append(li);
+  while (list.children.length > 6) list.removeChild(list.firstChild);
+}
+
+function drawMachine() {
+  const canvas = $("machine");
+  if (!canvas) return;
+  const c = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 300;
+  const h = 210;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  c.fillStyle = "#12171f";
+  c.fillRect(0, 0, w, h);
+
+  const [xMm, yMm] = robot ? toMM(robot.pos) : [0, 0];
+  const zMm = robot ? (robot.z ?? (robot.penDown ? 0 : MARKER_MM)) : MARKER_MM;
+  const down = robot ? robot.penDown && zMm < 0.4 : false;
+  $("readX").firstChild.textContent = `${xMm.toFixed(1)} `;
+  $("readY").firstChild.textContent = `${yMm.toFixed(1)} `;
+  const zRead = $("readZ");
+  zRead.classList.toggle("is-down", down);
+  zRead.firstChild.textContent = `${zMm.toFixed(1)} `;
+  zRead.querySelector("span").textContent = down ? "mm down" : "mm up";
+
+  const padL = 26, padR = 14, padT = 28, padB = 22;
+  const boardTop = padT + 24;
+  const boardH = h - boardTop - padB;
+  const boardW = w - padL - padR;
+  const px = (x, y) => [padL + (x / BOARD_MM.w) * boardW, boardTop + (1 - y / BOARD_MM.h) * boardH];
+  const [cx, cy] = px(xMm, yMm);
+  const lift = (zMm / MARKER_MM) * 26;
+
+  c.fillStyle = "#f4f7f8";
+  c.fillRect(padL, boardTop, boardW, boardH);
+  if (machineTrail.length > 1) {
+    c.strokeStyle = "#1f57c3";
+    c.lineWidth = 2;
+    c.lineCap = "round";
+    c.lineJoin = "round";
+    c.beginPath();
+    machineTrail.forEach((p, i) => {
+      const [tx, ty] = px(p[0], p[1]);
+      if (i === 0) c.moveTo(tx, ty);
+      else c.lineTo(tx, ty);
+    });
+    c.stroke();
+  }
+
+  c.strokeStyle = "#8b97a6";
+  c.lineWidth = 6;
+  c.beginPath();
+  c.moveTo(padL, boardTop - 8);
+  c.lineTo(padL, boardTop + boardH + 8);
+  c.moveTo(padL + boardW, boardTop - 8);
+  c.lineTo(padL + boardW, boardTop + boardH + 8);
+  c.stroke();
+
+  c.strokeStyle = "#d5dde6";
+  c.lineWidth = 8;
+  c.lineCap = "butt";
+  c.beginPath();
+  c.moveTo(padL - 4, cy);
+  c.lineTo(padL + boardW + 4, cy);
+  c.stroke();
+
+  c.fillStyle = "#2a3342";
+  c.strokeStyle = "#d6ff6b";
+  c.lineWidth = 2;
+  c.beginPath();
+  c.roundRect(cx - 16, cy - 14, 32, 28, 4);
+  c.fill();
+  c.stroke();
+
+  c.strokeStyle = down ? "#8eb6ff" : "#d6ff6b";
+  c.lineWidth = 3;
+  c.beginPath();
+  c.moveTo(cx, cy + 14 - lift);
+  c.lineTo(cx, cy + 14);
+  c.stroke();
+  c.fillStyle = down ? "#8eb6ff" : "#d6ff6b";
+  c.beginPath();
+  c.arc(cx, cy + 14, down ? 4 : 3, 0, Math.PI * 2);
+  c.fill();
+}
+
 function toMM([x, y]) {
   return [(x * BOARD_MM.w) / W, ((H - y) * BOARD_MM.h) / H];
 }
@@ -859,42 +1054,65 @@ function drawRobot(c) {
   c.restore();
 }
 
-function animateRobot(newStrokes) {
-  lastRobotObjs = [];
+function animateRobot(newStrokes, opts = {}) {
+  const owner = opts.owner || "robot";
+  const record = opts.record !== false;
+  const ink = opts.ink !== false;
+  if (record) lastRobotObjs = [];
   const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   if (reduce) {
-    newStrokes.forEach((pts) => {
-      const obj = { owner: "robot", points: pts };
-      strokes.push(obj);
-      lastRobotObjs.push(obj);
-    });
+    if (ink) {
+      newStrokes.forEach((pts) => {
+        const obj = { owner, points: pts };
+        strokes.push(obj);
+        if (record) lastRobotObjs.push(obj);
+      });
+    }
     render();
     return Promise.resolve();
   }
 
   const plan = buildPlan(newStrokes);
-  robot = { pos: HOME.slice(), penDown: false, active: null, target: null,
+  machineTrail = [];
+  $("machineLog").replaceChildren();
+  robot = { pos: HOME.slice(), penDown: false, z: MARKER_MM, active: null, target: null,
             done: 0, total: newStrokes.filter((s) => s.length >= 2).length };
-  let i = 0, penTimer = 0, lastTime = null;
+  let i = 0, penTimer = 0, lastTime = null, logged = -1;
 
   return new Promise((resolve) => {
     function frame(t) {
       if (lastTime === null) lastTime = t;
-      let budget = Math.min((t - lastTime) / 1000, 0.1) * speedMultiplier(); // machine-seconds this frame
+      let budget = Math.min((t - lastTime) / 1000, 0.05);
       lastTime = t;
 
       while (budget > 0 && i < plan.length) {
         const step = plan[i];
+        if (i !== logged) {
+          logged = i;
+          if (step.kind === "pen") logMachine(step.down ? "Marker down" : "Marker up");
+          else {
+            const [mx, my] = toMM(step.to);
+            logMachine(`${step.draw ? "Draw" : "Move"}  X ${mx.toFixed(1)}  Y ${my.toFixed(1)}`);
+          }
+        }
         if (step.kind === "pen") {
+          const need = MARKER_MM / axisSpeeds().z;
           penTimer += budget;
-          if (penTimer < PEN_TIME) { budget = 0; break; }
-          budget = penTimer - PEN_TIME;
+          const along = Math.min(penTimer / need, 1);
+          robot.z = step.down ? MARKER_MM * (1 - along) : MARKER_MM * along;
+          if (penTimer < need) { budget = 0; break; }
+          budget = penTimer - need;
           penTimer = 0;
           robot.penDown = step.down;
+          robot.z = step.down ? 0 : MARKER_MM;
           if (step.down) {
-            robot.active = { owner: "robot", points: [robot.pos.slice()] };
-            strokes.push(robot.active);
-            lastRobotObjs.push(robot.active);
+            robot.active = { owner, points: [robot.pos.slice()] };
+            if (ink) {
+              strokes.push(robot.active);
+              if (record) lastRobotObjs.push(robot.active);
+            }
+            const [tx, ty] = toMM(robot.pos);
+            machineTrail.push([tx, ty]);
           } else {
             robot.active = null;
             robot.done++;
@@ -902,20 +1120,26 @@ function animateRobot(newStrokes) {
           i++;
           continue;
         }
-        // move: travel or draw toward step.to at the right speed
         robot.target = step.to;
-        const rate = step.draw ? DRAW_RATE : TRAVEL_RATE;
         const dx = step.to[0] - robot.pos[0], dy = step.to[1] - robot.pos[1];
         const dist = Math.hypot(dx, dy);
-        const need = dist / rate;
-        if (budget >= need) {
+        const need = dist < 0.01 ? 0 : moveSeconds(robot.pos, step.to);
+        if (need === 0 || budget >= need) {
           robot.pos = step.to.slice();
-          if (step.draw && robot.active) robot.active.points.push(step.to.slice());
+          if (step.draw && robot.active) {
+            if (ink) robot.active.points.push(step.to.slice());
+            const [tx, ty] = toMM(robot.pos);
+            machineTrail.push([tx, ty]);
+          }
           budget -= need;
           i++;
         } else {
-          const f = (budget * rate) / dist;
+          const f = budget / need;
           robot.pos = [robot.pos[0] + dx * f, robot.pos[1] + dy * f];
+          if (step.draw) {
+            const [tx, ty] = toMM(robot.pos);
+            machineTrail.push([tx, ty]);
+          }
           budget = 0;
         }
       }
@@ -1020,6 +1244,28 @@ async function openSaved(id) {
     setBusy(false);
   }
 }
+
+function fromMM(x, y) {
+  return [(x * W) / BOARD_MM.w, H - (y * H) / BOARD_MM.h];
+}
+
+["speedX", "speedY", "speedZ"].forEach((id) => {
+  const input = $(id);
+  const out = $(id + "Out");
+  const show = () => { out.textContent = `${input.value} mm/s`; };
+  input.addEventListener("input", show);
+  show();
+});
+
+$("machineTest").onclick = async () => {
+  if (busy) return;
+  setBusy(true);
+  setStatus("Testing the gantry…", "robot");
+  const a = fromMM(120, 70), b = fromMM(460, 70), c = fromMM(460, 240), d = fromMM(120, 240);
+  await animateRobot([[a, b, c, d, a]], { ink: false, record: false });
+  setStatus("Test move finished. X, Y, and the marker are back home.", "robot");
+  setBusy(false);
+};
 
 window.addEventListener("resize", resize);
 resize();

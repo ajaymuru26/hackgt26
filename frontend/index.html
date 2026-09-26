@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=8">
 </head>
 <body>
   <main class="wall">
@@ -34,7 +34,7 @@
         <button id="textBtn" class="tool" aria-pressed="false" title="Ask (T): click the board, type a prompt, the robot writes the answer">
           <span class="cap cap-text" aria-hidden="true">?</span>Ask
         </button>
-        <button id="imageBtn" class="tool" title="Upload a picture of a problem for the robot to solve">
+        <button id="imageBtn" class="tool" title="Upload a picture. It fills the board. CV finish crops it to the whiteboard. Answer traces the marker and solves it.">
           <span class="cap cap-image" aria-hidden="true"></span>Image
         </button>
         <input id="imageInput" type="file" accept="image/*" hidden>
@@ -92,7 +92,7 @@
         <button class="action" data-action="drawing" title="Finish the picture on the board">
           <span class="action-label">Finish drawing</span>
         </button>
-        <button class="action" data-action="cv" title="Finish an unfinished drawing with OpenCV: complete a partial circle, close a gap, or add a missing side. No AI call.">
+        <button class="action" data-action="cv" title="With a photo up, crop it so only the whiteboard shows. With a drawing, finish the missing geometry.">
           <span class="action-label">CV finish</span>
         </button>
         <label class="review-toggle" title="After the first version, the same five-item checklist runs at least twice. Each pass is listed in the thought process.">
@@ -121,6 +121,35 @@
     </div>
     </div>
 
+    <div class="side">
+    <section class="machine" aria-label="Robot mechanism">
+      <div class="machine-head">
+        <h2>Robot</h2>
+        <button type="button" id="machineTest" class="tool">Test move</button>
+      </div>
+      <p class="machine-note">X runs left and right. Y runs the beam up and down. The marker lifts on its own. Speeds are millimetres per second. Preview multiplies all three.</p>
+      <canvas id="machine" width="560" height="210" aria-label="Gantry, carriage, and marker"></canvas>
+      <dl class="machine-readout">
+        <div><dt>X left / right</dt><dd id="readX">0.0<span>mm</span></dd></div>
+        <div><dt>Y up / down</dt><dd id="readY">0.0<span>mm</span></dd></div>
+        <div><dt>Marker</dt><dd id="readZ">8.0<span>mm up</span></dd></div>
+      </dl>
+      <div class="machine-speeds">
+        <label>X speed
+          <input id="speedX" type="range" min="10" max="400" value="120" aria-label="Left and right speed in millimetres per second">
+          <output id="speedXOut" for="speedX">120 mm/s</output>
+        </label>
+        <label>Y speed
+          <input id="speedY" type="range" min="10" max="400" value="80" aria-label="Up and down speed in millimetres per second">
+          <output id="speedYOut" for="speedY">80 mm/s</output>
+        </label>
+        <label>Marker
+          <input id="speedZ" type="range" min="5" max="200" value="40" aria-label="Marker up and down speed in millimetres per second">
+          <output id="speedZOut" for="speedZ">40 mm/s</output>
+        </label>
+      </div>
+      <ol id="machineLog" class="machine-log"></ol>
+    </section>
     <aside class="thoughts" aria-labelledby="thoughtsTitle">
       <div class="thoughts-head">
         <h2 id="thoughtsTitle">Thought process</h2>
@@ -130,7 +159,8 @@
       <ol id="thoughtList" class="thought-list"></ol>
     </aside>
     </div>
+    </div>
   </main>
-  <script src="app.js"></script>
+  <script src="app.js?v=7"></script>
 </body>
 </html>

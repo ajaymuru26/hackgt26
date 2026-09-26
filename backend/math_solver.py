@@ -31,7 +31,9 @@ def _parse(text: str):
 
 
 def _clean(expr: str) -> str:
-    expr = expr.replace("?", "_")
+    # A ? in a sentence is a question mark. A ? in "5+?" is a blank.
+    if len(re.findall(r"[A-Za-z]{2,}", expr)) < 2:
+        expr = expr.replace("?", "_")
     expr = re.sub(r"_+", " BLANK ", expr)
     # "3x4" or "_x4" written with an x means multiply, not the variable x
     for _ in range(2):

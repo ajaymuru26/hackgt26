@@ -77,9 +77,13 @@ class TraceRequest(BaseModel):
     y: float
     w: float
     h: float
-    detail: str = "medium"     # low | medium | high
+    detail: str = "medium"     # low | medium | high | marker
     width: int = 1200
     height: int = 700
+
+
+class CropRequest(BaseModel):
+    image: str                 # the original photo, before it is stretched onto the board
 
 
 class TranscribeRequest(BaseModel):
@@ -364,6 +368,23 @@ def stroke_rows(user_strokes, gap=10):
     return rows
 
 
+def picked_mode(ai, action: str) -> str:
+    """What to do with a read. A missing mode is not a drawing, and a question is not a picture."""
+    mode = str(ai.get("mode") or "").strip().lower()
+    question = str(ai.get("question") or "").strip()
+    if mode == "drawing" and action in ("answer", "work") and any(ch.isalpha() for ch in question):
+        return "answer"
+    if mode in ("math", "fill", "drawing", "answer", "hint", "check"):
+        return mode
+    if ai.get("problems") or str(ai.get("expression") or "").strip():
+        return "math"
+    if question or (action in ("answer", "work") and str(ai.get("answer") or "").strip()):
+        return "answer"
+    if str(ai.get("text") or "").strip():
+        return "fill"
+    return "drawing"
+
+
 def find_blank(expression, bbox, user_strokes):
     """Where is the blank? Look for an underscore-like stroke near where "_" sits in the text."""
     x1, y1, x2, y2 = bbox
@@ -397,6 +418,36 @@ def _separate_roots(answer: str) -> str:
     if len(parts) < 2 or any("=" in p for p in parts):
         return answer
     return " or ".join(f"{var}={p}" for p in parts)
+
+
+def solved_math(prob, expression) -> dict:
+    """SymPy first. The model's own answer is only a fallback when the transcription will not parse."""
+    try:
+        result = math_solver.solve(expression)
+    except Exception:
+        return math_from_ai(prob, expression)
+    result["answer"] = _separate_roots(result["answer"])
+    result["local"] = True
+    return result
+
+
+def local_check(prob) -> dict | None:
+    """Mark the student's line with SymPy. None means the transcription could not be checked."""
+    expression = str(prob.get("expression") or "").strip()
+    equation = str(prob.get("equation") or "").strip()
+    student = str(prob.get("student_answer") or "").strip()
+    if student.lower() in ("null", "none"):
+        student = ""
+    if not expression and not equation:
+        return None
+    try:
+        return math_solver.check_work(
+            expression=expression or None,
+            equation=equation or None,
+            student_answer=student or None,
+        )
+    except Exception:
+        return None
 
 
 def math_from_ai(prob, expression) -> dict:
@@ -573,21 +624,29 @@ def _complete(req: CompleteRequest):
                 "plan": "Reflect the ink across its right edge, onto the right.",
                 "strokes": strokes, "highlight": highlight, "steps": steps, "category": category}
 
-    step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
-                                f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
+    fast = req.action in ("answer", "work", "hint", "check")
+    if fast:
+        step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)}. "
+                                    "The model only reads the handwriting. Math is solved on this computer.")
+    else:
+        step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
+                                    f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
     if req.action == "drawing" and note:
         step("Your instruction", f"\"{note}\"")
     started = time.perf_counter()
     try:
-        ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
-                                  req.image_box, req.provider, note if req.action == "drawing" else "")
+        if fast:
+            ai = vision.read_fast(png, req.strokes, req.action, req.image_box, req.provider)
+        else:
+            ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
+                                      req.image_box, req.provider, note if req.action == "drawing" else "")
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
     steps[-1]["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
 
-    mode = ai.get("mode", "drawing")
+    mode = picked_mode(ai, req.action)
     description = ai.get("description", "")
     names = {"math": "math", "fill": "pattern", "drawing": "drawing", "answer": "a question",
              "hint": "a hint", "check": "checking work"}
@@ -615,27 +674,48 @@ def _complete(req: CompleteRequest):
         # Safety net: "1+1" looks like the letter H, so the AI may call math a drawing.
         # If it also read the strokes as math, math wins, and its own solution is what gets written.
         reading = str(ai.get("math_reading") or "").strip()
-        if mode != "math" and reading and reading.lower() not in ("null", "none") and any(ch.isdigit() for ch in reading):
+        if (mode != "math" and not (mode == "drawing" and req.image_box)
+                and reading and reading.lower() not in ("null", "none") and any(ch.isdigit() for ch in reading)):
             step("Changed its mind", f"The strokes also read as  {reading}  which is math. "
                                     "Handwritten math often looks like letters (1+1 looks like H), "
                                     "so treating it as math instead.")
             ai.setdefault("problems", [{"expression": reading, "answer": ai.get("math_answer"),
                                         "kind": ai.get("math_kind") or "evaluate"}])
             mode = "math"
+        if req.action in ("answer", "work") and mode == "drawing" and req.image_box:
+            step("Read it again", "The first pass called the photo a drawing. "
+                                  "Reading the writing again, and keeping periods and question marks.")
+            started_retry = time.perf_counter()
+            try:
+                ai = vision.read_fast(
+                    png, req.strokes, req.action, req.image_box, req.provider,
+                    note="The previous read was wrong. This is handwriting. Keep every period and the dot "
+                         "under each question mark. Respond with mode math or mode answer, never drawing.")
+            except RuntimeError as e:
+                raise HTTPException(500, str(e))
+            except Exception as e:
+                raise HTTPException(502, f"AI request failed: {e}")
+            steps[-1]["detail"] += f" The second read answered in {time.perf_counter() - started_retry:.1f} s."
+            mode = picked_mode(ai, req.action)
+            description = ai.get("description", description)
         if req.action in ("answer", "work") and mode == "drawing":
-            raise HTTPException(422, "I don't see a problem or question to answer. For pictures, use Finish drawing.")
+            raise HTTPException(422, "I couldn't read a problem or question there. "
+                                     "For a photo, press CV finish so only the whiteboard shows, then press Answer.")
     step("What it sees", description)
 
     if mode == "math":
         step("AI's notes", ai.get("reasoning"))
         problems = collect_problems(ai, layout)
         strokes, answers, expressions, failed, types = [], [], [], [], []
+        rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12  # tighter when problems sit close together
         for n, prob in enumerate(problems, 1):
             expression = prob["expression"]
+            if len(rows) == len(problems):
+                prob["bbox"] = rows[n - 1]
             label = f"Problem {n}" if len(problems) > 1 else "The problem"
             try:
-                result = math_from_ai(prob, expression)
+                result = solved_math(prob, expression)
             except Exception:
                 failed.append(expression)
                 step(f"{label}: couldn't solve", f"Read it as  {expression}  but the AI did not give a solution. Skipping it.")
@@ -655,12 +735,14 @@ def _complete(req: CompleteRequest):
                 new, where = write_steps(shown, bbox, req.width, req.height)
                 if not new:
                     new, where = place_answer(expression, result, bbox, req.width, req.height, blank)
-                detail = f"Read  {expression}  and the AI solved it: {result['answer']}. Writing the working {where}."
+                who = "solved it here" if result.get("local") else "the AI solved it"
+                detail = f"Read  {expression}  and {who}: {result['answer']}. Writing the working {where}."
                 if shown:
                     detail += "\n" + shown
             else:
                 new, where = place_answer(expression, result, bbox, req.width, req.height, blank)
-                detail = f"Read  {expression}  and the AI solved it: {result['answer']}. Writing it {where}."
+                who = "solved it here" if result.get("local") else "the AI solved it"
+                detail = f"Read  {expression}  and {who}: {result['answer']}. Writing it {where}."
             strokes += new
             types.append(math_category(expression, result["kind"]))
             answers.append(result["answer"])
@@ -676,7 +758,7 @@ def _complete(req: CompleteRequest):
             category = {"type": kinds_found[0], "detail": f"{len(types)} problems"}
         else:
             category = {"type": "Mixed math", "detail": ", ".join(f"{d} ({t.lower()})" for t, d in types)}
-        identify(category, "The AI's answer: "
+        identify(category, "Solved here: "
                  + "; ".join(f"{e} → {a}" for e, a in zip(expressions, answers)) + ".")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
         return {"mode": "math", "description": description, "expression": ";  ".join(expressions),
@@ -734,16 +816,23 @@ def _complete(req: CompleteRequest):
             raise HTTPException(422, "I couldn't find any problems with answers to check.")
         everything = content_bbox(layout) or (40, 40, req.width - 40, 120)
         strokes, right, wrong, empty = [], 0, 0, 0
+        rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12
         for n, prob in enumerate(problems, 1):
+            if len(rows) == len(problems):
+                prob["bbox"] = rows[n - 1]
             label = f"Problem {n}" if len(problems) > 1 else "Your problem"
             shown = prob.get("expression") or f"{prob.get('equation')}  ->  {prob.get('student_answer') or '(no answer)'}"
-            correct = prob.get("correct")
-            if isinstance(correct, str):
-                correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
-            if correct is None and str(prob.get("correct") or "").strip().lower() in ("null", "none", ""):
-                correct = None
-            fix = str(prob.get("correct_answer") or "").strip()
+            judged = local_check(prob)
+            if judged:
+                correct, fix = judged["correct"], str(judged.get("correct_answer") or "").strip()
+            else:
+                correct = prob.get("correct")
+                if isinstance(correct, str):
+                    correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
+                if correct is None and str(prob.get("correct") or "").strip().lower() in ("null", "none", ""):
+                    correct = None
+                fix = str(prob.get("correct_answer") or "").strip()
             x1, y1, x2, y2 = refine_bbox(prob.get("bbox") or everything, req.strokes, pad)
             size = min(max((y2 - y1) * 0.85, 28), 120)
             mx, my = x2 + size * 0.4, y1 + (y2 - y1 - size) / 2
@@ -754,7 +843,7 @@ def _complete(req: CompleteRequest):
             if correct:
                 right += 1
                 strokes += handwriting.text_to_strokes("✓", mx, my, size)
-                step(label, f"Read  {shown}  and the AI checked it: correct. Marked it with a check.")
+                step(label, f"Read  {shown}  and checked it here: correct. Marked it with a check.")
             else:
                 wrong += 1
                 strokes += handwriting.text_to_strokes("✗", mx, my, size)
@@ -764,7 +853,7 @@ def _complete(req: CompleteRequest):
                     fix_strokes, _, _ = text_writer.text_strokes(fix, fx, my + (size - cap) / 2, cap,
                                                                  max(req.width - fx - 10, cap * 3), "print", req.height - 10)
                     strokes += fix_strokes
-                step(label, f"Read  {shown}  and the AI checked it: not quite. The right answer is {fix or 'different'}, "
+                step(label, f"Read  {shown}  and checked it here: not quite. The right answer is {fix or 'different'}, "
                             "so it gets an X with the correct answer beside it.")
         total = right + wrong
         if not total:
@@ -1062,6 +1151,21 @@ def _speak(req: SpeakRequest):
     return result
 
 
+@app.post("/api/crop")
+def crop_board(req: CropRequest):
+    data = req.image.split(",", 1)[1] if req.image.startswith("data:") else req.image
+    try:
+        raw = base64.b64decode(data)
+        png = tracer.crop_whiteboard(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(422, f"Couldn't crop that image ({e}).")
+    if png is None:
+        return {"cropped": False}
+    return {"cropped": True, "image": "data:image/png;base64," + base64.b64encode(png).decode()}
+
+
 @app.post("/api/trace")
 def trace_image(req: TraceRequest):
     data = req.image.split(",", 1)[1] if req.image.startswith("data:") else req.image
@@ -1075,10 +1179,11 @@ def trace_image(req: TraceRequest):
     strokes = clean_strokes(strokes, req.width, req.height)
     if not strokes:
         raise HTTPException(422, "Couldn't find any clear lines in that image. Try High detail or a higher-contrast picture.")
-    why = ("It looks like line art on a light background, so it traces down the middle of each line "
-           "(each line drawn once) and outlines any solid filled areas."
-           if info["method"] == "centre lines" else
-           "It looks like a photo, so it traces the edges where light areas meet dark ones (Canny edge detection).")
+    why = {
+        "centre lines": "It looks like line art on a light background, so it traces down the middle of each line "
+                        "(each line drawn once) and outlines any solid filled areas.",
+        "marker": "Kept the dry-erase marker and left the photograph out. The board behind the ink is not drawn.",
+    }.get(info["method"], "It looks like a photo, so it traces the edges where light areas meet dark ones (Canny edge detection).")
     steps = [
         {"title": "Loaded your image", "detail": f"Placed it on the board at {req.w:.0f} x {req.h:.0f} px and shaded it in the background."},
         {"title": "Chose how to trace it", "detail": why},

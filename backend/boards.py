@@ -27,7 +27,8 @@ MAX_POINTS = 120
 
 def configured() -> bool:
     _reload()
-    return bool(os.getenv("MONGODB_URI", "").strip())
+    uri = os.getenv("MONGODB_URI", "").strip()
+    return uri.startswith("mongodb://") or uri.startswith("mongodb+srv://")
 
 
 def remember(result, *, source, action="", provider="", user_strokes=None, heard="", seconds=0.0):
@@ -126,28 +127,38 @@ def _summary(doc):
 
 
 def _collection():
-    global _client, _uri, _indexed
+    global _client, _uri, _indexed, _down_until
+    if time.time() < _down_until:
+        return None
     _reload()
     uri = os.getenv("MONGODB_URI", "").strip()
-    if not uri:
+    if not uri.startswith("mongodb://") and not uri.startswith("mongodb+srv://"):
         return None
-    if _client is None or uri != _uri:
-        _client = MongoClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=2500)
-        _uri = uri
+    try:
+        if _client is None or uri != _uri:
+            _client = MongoClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=2500)
+            _uri = uri
+            _indexed = False
+        name = os.getenv("MONGODB_DB", "").strip()
+        if name:
+            db = _client[name]
+        else:
+            try:
+                db = _client.get_default_database()
+            except PyMongoError:
+                db = _client["whiteboard"]
+        coll = db["boards"]
+        if not _indexed:
+            coll.create_index("created")
+            _indexed = True
+        return coll
+    except PyMongoError as e:
+        print(f"MongoDB unavailable: {e}")
+        _client = None
+        _uri = None
         _indexed = False
-    name = os.getenv("MONGODB_DB", "").strip()
-    if name:
-        db = _client[name]
-    else:
-        try:
-            db = _client.get_default_database()
-        except PyMongoError:
-            db = _client["whiteboard"]
-    coll = db["boards"]
-    if not _indexed:
-        coll.create_index("created")
-        _indexed = True
-    return coll
+        _down_until = time.time() + 30
+        return None
 
 
 def _reload():
