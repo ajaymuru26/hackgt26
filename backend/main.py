@@ -23,6 +23,7 @@ from pydantic import BaseModel
 import gcode
 import handwriting
 import math_solver
+import placement
 import shapes
 import text_writer
 import tracer
@@ -127,51 +128,106 @@ def _loose_box(box, w, h) -> bool:
     return (float(box[2]) - float(box[0])) >= w * 0.55 or (float(box[3]) - float(box[1])) >= h * 0.55
 
 
-def place_answer(expression, result, bbox, w, h, blank_bbox=None) -> list[Stroke]:
+def answer_shape(text, size) -> list[Stroke]:
+    """Answer text drawn at the origin, in the maths font when it has every character."""
+    if all(ch in handwriting.GLYPHS for ch in text):
+        return handwriting.text_to_strokes(text, 0, 0, size)
+    # full pen font for anything the small maths font can't draw (like i)
+    strokes, _, _ = text_writer.text_strokes(text, 0, 0, size * 0.8, 10 ** 6, "print")
+    return strokes
+
+
+def problem_core(bbox, ink, near_y=None):
+    """The problem's own line of characters, and their typical height.
+
+    The problem's box can grow to take in things that aren't the problem: a long line
+    crossing it, or notes on the next line. Sizing and lining up the answer from that box
+    gives a giant answer, or one floating between two lines."""
+    x1, y1, x2, y2 = bbox
+    inside = [stroke_bbox(s) for s in ink if s]
+    inside = [b for b in inside if b[2] >= x1 - 2 and b[0] <= x2 + 2 and b[3] >= y1 - 2 and b[1] <= y2 + 2]
+    heights = sorted(b[3] - b[1] for b in inside if b[3] - b[1] >= 10)
+    if not heights:
+        return bbox, y2 - y1
+    char_h = heights[len(heights) // 2]
+    # drop long lines through the problem (much taller or wider than a character)
+    core = [b for b in inside if b[3] - b[1] <= 1.8 * char_h and b[2] - b[0] <= 6 * char_h]
+    rows = []
+    for b in sorted(core, key=lambda b: (b[1] + b[3]) / 2):
+        if rows and (b[1] + b[3]) / 2 <= rows[-1][3] + 0.25 * char_h:
+            r = rows[-1]
+            rows[-1] = [min(r[0], b[0]), min(r[1], b[1]), max(r[2], b[2]), max(r[3], b[3])]
+        else:
+            rows.append(list(b))
+    if not rows:
+        return bbox, char_h
+    # the line the AI pointed at (or the top one), not whatever else got merged in
+    row = min(rows, key=lambda r: abs((r[1] + r[3]) / 2 - near_y)) if near_y is not None else rows[0]
+    return tuple(row), char_h
+
+
+def place_answer(expression, result, bbox, w, h, board, blank_bbox=None, ink=(), near_y=None) -> list[Stroke]:
+    bbox, _ = problem_core(bbox, ink, near_y)
     x1, y1, x2, y2 = bbox
     eq_h = max(y2 - y1, 1)
     size = min(max(eq_h * 0.92, 28), 160)
     text = result["answer"]
 
+    if result["kind"] == "blank" and re.search(r"=[_?]$", str(expression).replace(" ", "")):
+        # "10-8=_" is just "10-8=". A long lower bar on an equals sign is easy to misread
+        # as a blank line, and writing "in" it would put the answer on top of the "=".
+        expression = str(expression).replace(" ", "")[:-1]
+        result, blank_bbox = {**result, "kind": "evaluate"}, None
+
     if result["kind"] == "blank" and blank_bbox:
         bx1, _, bx2, _ = blank_bbox
-        width = handwriting.text_width(text, size)
-        x = (bx1 + bx2) / 2 - width / 2  # centred in the blank, on the equation's line
-        y = y1 + (eq_h - size) / 2
-        x = max(10, min(x, w - width - 10))
-        return handwriting.text_to_strokes(text, x, max(10, y), size), "inside the blank"
+        cx = (bx1 + bx2) / 2
+        # The blank's underline may be written on; nothing else on the board may.
+        lines = []
+        for s in ink:
+            if not s:
+                continue
+            a, b, c, d = stroke_bbox(s)
+            flat = (c - a) > 20 and (d - b) < 0.3 * (c - a)
+            in_blank = min(c, bx2 + 10) - max(a, bx1 - 10) >= 0.6 * (c - a)  # not the bar of a "+" beside it
+            low = b >= y1 + 0.45 * eq_h and d <= y2 + 0.5 * eq_h  # underlines sit on the baseline
+            if flat and in_blank and low:
+                lines.append(s)
+        line_top = min(stroke_bbox(s)[1] for s in lines) if lines else None
+        clear = board.without(lines) if lines else board
+
+        def blank_spots(s, bw, bh):
+            if line_top is not None:
+                on = (cx - bw / 2, line_top - s - 4, "on the blank line")
+            else:
+                on = (cx - bw / 2, y1 + (eq_h - s) / 2, "inside the blank")
+            return [on, (cx - bw / 2, y2 + max(0.35 * s, placement.GAP), "just under the blank")]
+
+        got = placement.place(clear, lambda s: handwriting.text_to_strokes(text, 0, 0, s), blank_spots,
+                              placement.shrinking(size, steps=3, factor=0.8), spot_first=True)
+        if clear is not board:
+            board.add(got.strokes)
+        return got.strokes, f"{got.where}, {got.size:.0f} px tall to match your writing"
 
     if result["kind"] == "evaluate" and not str(expression).strip().endswith("="):
         text = "=" + text  # person wrote "12+7" with no equals sign
 
-    gap = 0.28 * size
-    x = x2 + gap
-    y = y1 + (eq_h - size) / 2
-    where = "right after the problem, on the same line"
-    if result["kind"] == "solve":
-        x, y, where = x1, y2 + 0.35 * size, "underneath the equation"
-    else:
-        width = handwriting.text_width(text, size)
-        if x + width > w - 10:
-            avail = (w - 10) - x
-            if avail >= 48:
-                size = max(22, min(size, size * avail / width))
-                y = y1 + (eq_h - size) / 2
-                width = handwriting.text_width(text, size)
-            if x + width > w - 10:
-                # Stay attached to the end of the problem instead of jumping across the board.
-                y = y2 + 0.2 * size
-                x = max(10, x2 - width)
-                where = "just under the end of the problem"
-    if all(ch in handwriting.GLYPHS for ch in text):
-        x = max(10, min(x, w - handwriting.text_width(text, size) - 10))
-        y = max(10, min(y, h - size * 1.2))
-        return handwriting.text_to_strokes(text, x, y, size), f"{where}, {size:.0f} px tall to match your writing"
-    cap = size * 0.8  # full pen font for anything the small maths font can't draw (like i)
-    x = max(10, min(x, w - text_writer.measure(text, "print", cap) - 10))
-    y = max(10, min(y, h - cap * 1.4))
-    strokes, _, _ = text_writer.text_strokes(text, x, y, cap, max(w - x - 20, cap * 3), "print", h - 10)
-    return strokes, f"{where}, {cap:.0f} px tall to match your writing"
+    def spots(s, bw, bh):
+        gap = placement.GAP
+        right = (x2 + max(0.28 * s, gap), y1 + (eq_h - s) / 2, "right after the problem, on the same line",
+                 0.6 * s)
+        under_end = (x2 - bw, y2 + max(0.2 * s, gap), "just under the end of the problem")
+        under = (x1, y2 + max(0.35 * s, gap), "underneath the equation")
+        above = (x1, y1 - bh - max(0.35 * s, gap), "above the problem")
+        left = (x1 - bw - max(0.4 * s, gap), y1 + (eq_h - s) / 2, "to the left of the problem")
+        if result["kind"] == "solve":
+            return [under, right, under_end, above, left]
+        return [right, under_end, under, above, left]
+
+    # Shrink a little to stay on the problem's line before moving somewhere else.
+    got = placement.place(board, lambda s: answer_shape(text, s), spots,
+                          placement.shrinking(size, steps=3, factor=0.8), spot_first=True)
+    return got.strokes, f"{got.where}, {got.size:.0f} px tall to match your writing"
 
 
 def content_bbox(strokes):
@@ -220,29 +276,33 @@ def image_covers_board(box, w, h) -> bool:
     return (x2 - x1) >= w * 0.9 and (y2 - y1) >= h * 0.9
 
 
-def write_below(text, user_strokes, w, h, style="print", max_size=60):
-    """Write text under the person's writing, shrinking it until every line fits.
-    When the picture already fills the board, write across the picture instead."""
+def write_below(text, user_strokes, w, h, board, style="print", max_size=60):
+    """Write text under the person's writing, shrinking it until it fits somewhere clear.
+    When the picture already fills the board, write across the picture instead.
+    Returns (strokes, size, lines written, where)."""
     box = content_bbox(user_strokes)
     rows = stroke_rows(user_strokes)
     line_h = min((r[3] - r[1]) for r in rows) if rows else 48
     size = min(max(line_h * 0.8, 28), max_size)
-    if box is None:
-        x = 36
-        while True:
-            y = max(10, h * 0.62)
-            strokes, written, dropped = text_writer.text_strokes(
-                text, x, y, size, max(w - x - 20, size * 3), style, h - 10)
-            if not dropped or size <= 22:
-                return strokes, size, written, dropped
-            size *= 0.85
-    x = max(10, box[0])
-    while True:
-        y = min(box[3] + size * 0.6, h - size * 1.4)
-        strokes, written, dropped = text_writer.text_strokes(text, x, y, size, max(w - x - 20, size * 3), style, h - 10)
-        if not dropped or size <= 22:
-            return strokes, size, written, dropped
-        size *= 0.85
+    x = 36 if box is None else max(10, box[0])
+
+    def wrap_width(s):
+        return max(w - x - 20, s * 3)
+
+    def render(s):
+        return text_writer.text_strokes(text, 0, 0, s, wrap_width(s), style)[0]
+
+    def spots(s, bw, bh):
+        if box is None:
+            return [(x, max(10, h * 0.62), "across the picture")]
+        gap = max(s * 0.6, placement.GAP)
+        return [(x, box[3] + gap, "under your work"),
+                (x, box[1] - bh - gap, "above your work"),
+                (box[2] + max(s, placement.GAP), box[1], "to the right of your work")]
+
+    got = placement.place(board, render, spots, placement.shrinking(size))
+    written = len(text_writer.wrap(text, style, got.size, wrap_width(got.size))) if got.strokes else 0
+    return got.strokes, got.size, written, got.where
 
 
 def stroke_rows(user_strokes, gap=10):
@@ -334,9 +394,12 @@ def complete(req: CompleteRequest):
     layout = list(req.strokes)
     # A picture that fills the board is the board. Don't treat its outline as writing,
     # or answers get pushed into a margin that isn't there. They are drawn on the picture.
-    if req.image_box and not image_covers_board(req.image_box, req.width, req.height):
+    covers = bool(req.image_box) and image_covers_board(req.image_box, req.width, req.height)
+    if req.image_box and not covers:
         bx1, by1, bx2, by2 = req.image_box
         layout.append([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]])
+    # Where ink already is, so nothing the robot writes lands on top of it
+    board = placement.Board(req.width, req.height, req.strokes, png, req.image_box, image_is_board=covers)
 
     steps = []  # the robot's thought process, shown in the frontend
 
@@ -431,7 +494,11 @@ def complete(req: CompleteRequest):
             blank = prob.get("blank_bbox")
             if result["kind"] == "blank" and not blank:
                 blank = find_blank(expression, bbox, req.strokes)
-            new, where = place_answer(expression, result, bbox, req.width, req.height, blank)
+            ai_box = prob.get("bbox")
+            near_y = ((float(ai_box[1]) + float(ai_box[3])) / 2
+                      if ai_box and not _loose_box(ai_box, req.width, req.height) else None)
+            new, where = place_answer(expression, result, bbox, req.width, req.height, board, blank,
+                                      req.strokes, near_y)
             strokes += new
             try:
                 types.append(math_solver.classify(expression, result))
@@ -461,18 +528,24 @@ def complete(req: CompleteRequest):
         text = str(ai.get("text", "")).strip()
         if not text:
             raise HTTPException(422, "The AI couldn't figure out what comes next.")
+        box = content_bbox(layout) or (40, 40, 200, 90)
         try:
             x, y, size = (float(v) for v in ai.get("position", [])[:3])
         except (TypeError, ValueError):
-            box = content_bbox(layout) or (40, 40, 200, 90)
             x, y, size = box[2] + 20, box[1], max(box[3] - box[1], 28)
         step("Found the rule", ai.get("reasoning"))
         size = min(max(size * 0.85, 28), 160)
-        x = max(10, min(x, req.width - text_writer.measure(text, "print", size) - 10))
-        y = max(10, min(y, req.height - size * 1.4))
-        strokes, _, _ = text_writer.text_strokes(text, x, y, size, max(req.width - x - 20, size * 3), "print",
-                                                 req.height - 10)
-        step("Chose what to write", f"Writing {text} next in the sequence, {size:.0f} px tall to match.")
+
+        def fill_spots(s, bw, bh):
+            gap = placement.GAP
+            return [(x, y, "where the next item goes"),
+                    (box[2] + max(0.4 * s, gap), box[1], "right after the last item"),
+                    (box[0], box[3] + max(0.5 * s, gap), "on the next line")]
+
+        got = placement.place(board, lambda s: text_writer.text_strokes(text, 0, 0, s, 10 ** 6, "print")[0],
+                              fill_spots, placement.shrinking(size, steps=3, factor=0.8), spot_first=True)
+        strokes = got.strokes
+        step("Chose what to write", f"Writing {text} next in the sequence {got.where}, {got.size:.0f} px tall to match.")
         numeric = any(ch.isdigit() for ch in text)
         category = {"type": "Number pattern" if numeric else "Pattern", "detail": description or "a sequence to continue"}
         identify(category, "It's a sequence, so the next items follow a rule instead of an equation.")
@@ -486,10 +559,10 @@ def complete(req: CompleteRequest):
             raise HTTPException(422, "Couldn't think of a hint for this. Try writing a bit more.")
         step("Thought about the next step", ai.get("reasoning"))
         text = hint if hint.lower().startswith("hint") else f"Hint: {hint}"
-        strokes, size, written, _ = write_below(text, layout, req.width, req.height, "cursive")
+        strokes, size, written, where = write_below(text, layout, req.width, req.height, board, "cursive")
         if not strokes:
-            raise HTTPException(422, "There's no room left under your work for a hint.")
-        step("Wrote a hint", f"\"{text}\" under your work in cursive, without giving away the answer.")
+            raise HTTPException(422, "There's no room left on the board for a hint.")
+        step("Wrote a hint", f"\"{text}\" {where} in cursive, without giving away the answer.")
         category = {"type": "Hint", "detail": description or "a nudge toward the next step"}
         identify(category, "You asked for a hint, so it points you to the next step instead of solving it.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
@@ -514,26 +587,37 @@ def complete(req: CompleteRequest):
                 continue
             x1, y1, x2, y2 = refine_bbox(prob.get("bbox") or everything, req.strokes, pad)
             size = min(max((y2 - y1) * 0.85, 28), 120)
-            mx, my = x2 + size * 0.4, y1 + (y2 - y1 - size) / 2
             if result["correct"] is None:
                 empty += 1
                 step(label, f"Read  {shown}  but there's no answer written yet, so nothing to mark.")
                 continue
+            fix = result.get("correct_answer")
+
+            def mark(s, correct=result["correct"], fix=fix):
+                """A check, or an X with the right answer beside it, drawn at the origin."""
+                if correct:
+                    return handwriting.text_to_strokes("✓", 0, 0, s)
+                cap = s * 0.55
+                return (handwriting.text_to_strokes("✗", 0, 0, s)
+                        + text_writer.text_strokes(fix, s * 0.95, (s - cap) / 2, cap, 10 ** 6, "print")[0])
+
+            def mark_spots(s, bw, bh, x1=x1, y1=y1, x2=x2, y2=y2):
+                gap = placement.GAP
+                return [(x2 + max(s * 0.4, gap), y1 + (y2 - y1 - s) / 2, "beside it", 0.6 * s),
+                        (x2 - bw, y2 + max(0.2 * s, gap), "just under the end of it"),
+                        (x1 - bw - max(s * 0.4, gap), y1 + (y2 - y1 - s) / 2, "to the left of it"),
+                        (x1, y1 - bh - max(0.3 * s, gap), "above it")]
+
+            got = placement.place(board, mark, mark_spots, placement.shrinking(size, steps=3, factor=0.8),
+                                  spot_first=True)
+            strokes += got.strokes
             if result["correct"]:
                 right += 1
-                strokes += handwriting.text_to_strokes("✓", mx, my, size)
-                step(label, f"Read  {shown}  and checked it with SymPy: correct. Marked it with a check.")
+                step(label, f"Read  {shown}  and checked it with SymPy: correct. Marked it with a check {got.where}.")
             else:
                 wrong += 1
-                strokes += handwriting.text_to_strokes("✗", mx, my, size)
-                fix = result["correct_answer"]
-                cap = size * 0.55
-                fx = mx + size * 0.95
-                fix_strokes, _, _ = text_writer.text_strokes(fix, fx, my + (size - cap) / 2, cap,
-                                                             max(req.width - fx - 10, cap * 3), "print", req.height - 10)
-                strokes += fix_strokes
                 step(label, f"Read  {shown}  and checked it with SymPy: not quite. The right answer is {fix}, "
-                            "so it gets an X with the correct answer beside it.")
+                            f"so it gets an X with the correct answer, {got.where}.")
         total = right + wrong
         if not total:
             raise HTTPException(422, "I didn't find any finished answers to check. Write your answer after the = sign.")
@@ -567,7 +651,7 @@ def complete(req: CompleteRequest):
         if ink and re.fullmatch(r"=?\s*[\d./+\-xXi]+", answer.replace(" ", "")):
             shown = answer[1:].strip() if answer.startswith("=") else answer
             strokes, where = place_answer("problem", {"kind": "evaluate", "answer": shown}, ink,
-                                          req.width, req.height)
+                                          req.width, req.height, board)
             if strokes:
                 step("Wrote the answer", f"\"{answer}\" {where}.")
                 category = {"type": "Question", "detail": question}
@@ -575,11 +659,11 @@ def complete(req: CompleteRequest):
                 step("Planned the robot", robot_summary(strokes, req.width, req.height))
                 return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
                         "steps": steps, "category": category}
-        strokes, size, written, dropped = write_below(answer, layout, req.width, req.height)
+        strokes, size, written, where = write_below(answer, layout, req.width, req.height, board)
         if not strokes:
-            raise HTTPException(422, "There's no room under your question. Write it higher up on the board.")
-        step("Wrote the answer", f"\"{answer}\" under your question, {size:.0f} px tall, in {written} line(s)"
-             + (f" ({dropped} didn't fit)" if dropped else "") + ".")
+            raise HTTPException(422, "There's no room left on the board for the answer.")
+        step("Wrote the answer", f"\"{answer}\" {where.replace('your work', 'your question')}, "
+                                 f"{size:.0f} px tall, in {written} line(s).")
         category = {"type": "Question", "detail": question}
         identify(category, "It's written words asking something, so the robot answers it instead of solving or drawing.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
@@ -711,11 +795,24 @@ def ask(req: AskRequest):
     if not answer:
         raise HTTPException(422, "The AI didn't come up with an answer. Try rephrasing your prompt.")
 
-    strokes, written, dropped = text_writer.text_strokes(answer, x, ay, size, wrap_w, style, req.height - 10)
+    board = placement.Board(req.width, req.height, req.strokes + prompt_strokes)
+    pbox = placement.bounds(prompt_strokes) if prompt_strokes else (x, y, x, y)
+
+    def ask_spots(s, bw, bh):
+        gap = placement.GAP
+        return [(x, max(ay, pbox[3] + gap), "under your prompt"),
+                (pbox[2] + max(s, gap), pbox[1], "to the right of your prompt"),
+                (x, pbox[1] - bh - max(s * 0.35, gap), "above your prompt")]
+
+    got = placement.place(board, lambda s: text_writer.text_strokes(answer, 0, 0, s, max(req.width - x - 20, s * 3),
+                                                                    style)[0],
+                          ask_spots, placement.shrinking(size))
+    strokes = got.strokes
     if not strokes:
         raise HTTPException(422, "There's no room to write there. Try clicking higher up on the board.")
-    steps.append({"title": "Wrote the answer", "detail": f"\"{answer}\" in {written} line(s)"
-                  + (f" ({dropped} line(s) didn't fit)" if dropped else "") + ", using a single-stroke pen font."})
+    written = len(text_writer.wrap(answer, style, got.size, max(req.width - x - 20, got.size * 3)))
+    steps.append({"title": "Wrote the answer", "detail": f"\"{answer}\" {got.where}, in {written} line(s), "
+                                                         "using a single-stroke pen font."})
     steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, req.width, req.height)})
     return {"mode": "answer", "description": prompt, "answer": answer, "strokes": strokes,
             "prompt_strokes": prompt_strokes, "steps": steps, "category": {"type": "Answer", "detail": prompt}}
