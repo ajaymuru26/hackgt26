@@ -57,7 +57,7 @@ The defaults are `gpt-4o` and `claude-sonnet-5`, respectively.
 - **Undo, clear, replay, and speed controls** for editing and previewing the output.
 - **G-code export** for pen plotters.
 
-Math is computed with SymPy rather than relying on the AI to calculate the result. For example:
+Math is solved by the AI. For example:
 
 - `12+7=` writes `19` after the equals sign.
 - `2x+3=7` writes `x=2` underneath.
@@ -68,8 +68,7 @@ Math is computed with SymPy rather than relying on the AI to calculate the resul
 ## Backend map
 
 - `backend/main.py`: FastAPI routes, request validation, and response assembly. Also serves the frontend.
-- `backend/vision.py`: prepares board images and stroke coordinates for the AI provider.
-- `backend/math_solver.py`: parses and solves math with SymPy.
+- `backend/vision.py`: prepares board images and stroke coordinates, and asks the AI to read and solve the maths.
 - `backend/shapes.py`: converts AI-described shapes into strokes and snaps them to the user's drawing.
 - `backend/handwriting.py` and `backend/text_writer.py`: convert answers and text into plotter strokes.
 - `backend/gcode.py`: orders strokes, converts pixels to millimetres, and generates G-code.

@@ -21,6 +21,8 @@ from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import boards
+import cv_finish
 import gcode
 import handwriting
 import math_solver
@@ -45,6 +47,8 @@ class CompleteRequest(BaseModel):
     action: str = ""            # answer | hint | check | drawing (which button was pressed)
     image_box: list[float] | None = None  # where an uploaded picture sits on the board [x1, y1, x2, y2]
     review: bool = True         # let the AI look at its drawing once and fix mistakes
+    provider: str = "openai"    # openai | gemini, chosen by the buttons on the board
+    instruction: str = ""       # what the person typed for Finish drawing
 
 
 class WriteRequest(BaseModel):
@@ -67,6 +71,7 @@ class AskRequest(BaseModel):
     style: str = "print"
     width: int = 1200
     height: int = 700
+    provider: str = "openai"    # openai | gemini
 
 
 class TraceRequest(BaseModel):
@@ -78,6 +83,85 @@ class TraceRequest(BaseModel):
     detail: str = "medium"     # low | medium | high
     width: int = 1200
     height: int = 700
+
+
+class TranscribeRequest(BaseModel):
+    audio: str                 # a clip so far, as a data URL or plain base64
+    mime: str = "audio/webm"
+
+
+class SpeakRequest(BaseModel):
+    audio: str                 # recording as a data URL or plain base64
+    mime: str = "audio/webm"
+    text: str = ""             # words already shown while they were talking
+    image: str
+    strokes: list[Stroke] = []
+    width: int = 1200
+    height: int = 700
+    provider: str = "openai"
+    size: float = 48
+    style: str = "print"
+
+
+def _open_box(strokes, w, h):
+    """A free rectangle for a spoken drawing, away from ink already on the board."""
+    box = content_bbox(strokes)
+    if not box:
+        return [70.0, 50.0, float(w - 50), float(h - 40)]
+    if w - box[2] >= 300:
+        return [box[2] + 28, 40.0, float(w - 30), float(h - 30)]
+    if h - box[3] >= 180:
+        return [max(20.0, box[0]), box[3] + 28, float(w - 30), float(h - 30)]
+    return [70.0, 50.0, float(w - 50), float(h - 40)]
+
+
+def _from_prompt(ai, prompt, x, y, size, style, width, height, steps, prompt_strokes, ink=()):
+    """Turn an ask/speak model reply into strokes the robot can draw.
+    `ink` is what's already on the board, which the answer keeps clear of."""
+    if ai.get("kind") == "drawing":
+        if ai.get("description"):
+            steps.append({"title": "Decided to draw", "detail": ai["description"]})
+        log = []
+        strokes = clean_strokes(shapes.build_strokes({"shapes": ai.get("shapes")}, [], log), width, height)
+        for note in log:
+            steps.append({"title": "Made the drawing", "detail": note})
+        if not strokes:
+            raise HTTPException(422, "The AI couldn't work out how to draw that. Try describing it differently.")
+        steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, width, height)})
+        return {"mode": "drawing", "description": ai.get("description", "a drawing"), "answer": "", "strokes": strokes,
+                "prompt_strokes": prompt_strokes, "steps": steps,
+                "category": {"type": "Drawing", "detail": ai.get("description", prompt)}}
+
+    answer = str(ai.get("answer", "")).strip()
+    if ai.get("reasoning"):
+        steps.append({"title": "How it answered", "detail": ai["reasoning"]})
+    if not answer:
+        raise HTTPException(422, "The AI didn't come up with an answer. Try saying it again.")
+    board = placement.Board(width, height, list(ink) + list(prompt_strokes))
+    pbox = placement.bounds(prompt_strokes) if prompt_strokes else None
+
+    def wrap_w(s):
+        return max(width - x - 20, s * 3)
+
+    def spots(s, bw, bh):
+        gap = placement.GAP
+        if not pbox:
+            return [(x, y, "where you asked")]
+        return [(x, max(y, pbox[3] + gap), "under your prompt"),
+                (pbox[2] + max(s, gap), pbox[1], "to the right of your prompt"),
+                (x, pbox[1] - bh - max(s * 0.35, gap), "above your prompt")]
+
+    got = placement.place(board, lambda s: text_writer.text_strokes(answer, 0, 0, s, wrap_w(s), style)[0],
+                          spots, placement.shrinking(size))
+    strokes = got.strokes
+    if not strokes:
+        raise HTTPException(422, "There's no room to write there. Clear some space and try again.")
+    written = len(text_writer.wrap(answer, style, got.size, wrap_w(got.size)))
+    steps.append({"title": "Wrote the answer", "detail": f"\"{answer}\" {got.where}, in {written} line(s), "
+                                                         "using a single-stroke pen font."})
+    steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, width, height)})
+    return {"mode": "answer", "description": prompt, "answer": answer, "strokes": strokes,
+            "prompt_strokes": prompt_strokes, "steps": steps, "category": {"type": "Answer", "detail": prompt}}
 
 
 class GcodeRequest(BaseModel):
@@ -232,6 +316,45 @@ def place_answer(expression, result, bbox, w, h, board, blank_bbox=None, ink=(),
     return got.strokes, f"{got.where}, {got.size:.0f} px tall to match your writing"
 
 
+def clean_work(text) -> str:
+    """A few plain lines of working. The robot writes these under the problem."""
+    lines = []
+    for line in str(text or "").replace("\\n", "\n").splitlines():
+        line = " ".join(line.strip().split())
+        if line:
+            lines.append(line[:140])
+    return "\n".join(lines[:5])
+
+
+def with_final(work: str, answer: str) -> str:
+    answer = str(answer or "").strip()
+    if not work:
+        return answer
+    if not answer or answer in work:
+        return work
+    return f"{work}\n{answer}"
+
+
+def write_steps(text, bbox, w, h):
+    """Write every line of working under the problem, shrunk so none are cut off."""
+    x1, _, _, y2 = bbox
+    x = max(10, min(float(x1), w - 40))
+    width = max(w - x - 12, 160)
+    bottom = h - 8
+    gap = text_writer.LINE_GAP
+    count = max(len(text_writer.wrap(text, "print", 18, width)), 1)
+    size = min(28, max(14, (bottom - 12) / (count * gap)))
+    block = size * gap * count
+    under = float(y2) + size * 0.35
+    y = under if under + block <= bottom else max(8, bottom - block)
+    strokes, written, dropped = text_writer.text_strokes(
+        text, x, y, size, width, "print", bottom + 4)
+    where = f"under the problem, {written} line(s) of working, {size:.0f} px tall"
+    if dropped:
+        where += f" ({dropped} line(s) didn't fit)"
+    return strokes, where
+
+
 def content_bbox(strokes):
     pts = [p for s in strokes for p in s]
     return stroke_bbox(pts) if pts else None
@@ -343,6 +466,53 @@ def find_blank(expression, bbox, user_strokes):
     return [guess_x - half, y1, guess_x + half, y2]
 
 
+def _separate_roots(answer: str) -> str:
+    """x=-1,3 is two roots. Written that way it looks like the single number -13."""
+    match = re.fullmatch(r"\s*([A-Za-z])\s*=\s*(.+?)\s*", answer)
+    if not match:
+        return answer
+    var, rest = match.group(1), match.group(2)
+    parts = [p.strip() for p in re.split(r"\s*,\s*|\s*;\s*|\s+\bor\b\s+", rest) if p.strip()]
+    if len(parts) < 2 or any("=" in p for p in parts):
+        return answer
+    return " or ".join(f"{var}={p}" for p in parts)
+
+
+def math_from_ai(prob, expression) -> dict:
+    """The solution the model computed. Kind only decides where the robot writes it."""
+    answer = str(prob.get("answer") or "").strip()
+    if not answer or answer.lower() in ("null", "none"):
+        raise ValueError("no answer")
+    kind = str(prob.get("kind") or "").strip().lower()
+    if kind not in ("evaluate", "solve", "blank", "check"):
+        if prob.get("blank_bbox") or "_" in expression:
+            kind = "blank"
+        elif re.search(r"[a-zA-Z]", re.sub(r"(\d)\s*[xX]\s*(\d)", r"\1*\2", expression)):
+            kind = "solve"
+        else:
+            kind = "evaluate"
+    return {"kind": kind, "answer": _separate_roots(answer)}
+
+
+def math_category(expression, kind) -> tuple[str, str]:
+    if kind == "solve":
+        body = expression.lower().replace(" ", "")
+        if "^2" in body or "**2" in body or "²" in body:
+            detail = "quadratic equation"
+        elif "^3" in body or "**3" in body or "³" in body:
+            detail = "cubic equation"
+        else:
+            detail = "equation"
+        return "Algebra", detail
+    if kind == "blank":
+        return "Fill in the blank", "a missing number"
+    if kind == "check":
+        return "Arithmetic", "checking a finished equation"
+    if "/" in expression:
+        return "Arithmetic", "fractions"
+    return "Arithmetic", "a calculation"
+
+
 def collect_problems(ai, user_strokes):
     """One entry per separate problem, even if the AI squashed several into one string."""
     everything = content_bbox(user_strokes) or (40, 40, 400, 120)
@@ -355,14 +525,17 @@ def collect_problems(ai, user_strokes):
         parts = [p.strip() for p in re.split(r"[;\n]+", str(prob.get("expression", ""))) if p.strip()]
         if len(parts) <= 1:
             if parts:
-                problems.append({"expression": parts[0], "bbox": prob.get("bbox") or everything,
-                                 "blank_bbox": prob.get("blank_bbox")})
+                problems.append({"expression": parts[0], "answer": prob.get("answer"), "kind": prob.get("kind"),
+                                 "work": prob.get("work"),
+                                 "bbox": prob.get("bbox") or everything, "blank_bbox": prob.get("blank_bbox")})
             continue
         # Several problems in one string: match each to a line of writing, top to bottom
         rows = stroke_rows(user_strokes)
         for i, part in enumerate(parts):
             box = rows[i] if len(rows) == len(parts) else (prob.get("bbox") or everything)
-            problems.append({"expression": part, "bbox": box, "blank_bbox": None})
+            problems.append({"expression": part, "answer": prob.get("answer") if len(parts) == 1 else None,
+                             "kind": prob.get("kind"), "work": prob.get("work") if i == 0 else None,
+                             "bbox": box, "blank_bbox": None})
     return problems
 
 
@@ -383,8 +556,31 @@ def robot_summary(strokes, w, h) -> str:
             f"and {travel:.0f} mm of pen-up travel, roughly {seconds:.0f} s on the real robot.")
 
 
+_REFLECT = re.compile(
+    r"reflect|mirror|both side|other side|other half|flip|right side|left side|\bface\b",
+    re.I,
+)
+
+
+def _reflected(req: CompleteRequest):
+    """Flip the ink across its right edge, so the copy sits on the right."""
+    log = []
+    raw = shapes.build_strokes(
+        {"shapes": [{"type": "mirror", "strokes": "all", "axis": "vertical"}]},
+        req.strokes, log, (req.width, req.height))
+    return clean_strokes(raw, req.width, req.height), shapes.highlight_ids(), log
+
+
 @app.post("/api/complete")
 def complete(req: CompleteRequest):
+    started = time.perf_counter()
+    result = _complete(req)
+    boards.remember(result, source="complete", action=req.action, provider=req.provider,
+                    user_strokes=req.strokes, seconds=time.perf_counter() - started)
+    return result
+
+
+def _complete(req: CompleteRequest):
     data = req.image.split(",", 1)[1] if req.image.startswith("data:") else req.image
     try:
         png = base64.b64decode(data)
@@ -418,14 +614,55 @@ def complete(req: CompleteRequest):
     what = f"your {len(req.strokes)} stroke(s)" + (" and your uploaded image" if req.image_box else "")
     if not req.strokes:
         what = "your uploaded image"
-    step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
-                                f"and each stroke's exact points to {vision.provider_name()}.")
     if req.action == "drawing":
         req.mode = "drawing"
+    note = req.instruction.strip()[:400]
+    if req.action == "cv":
+        if not req.strokes:
+            raise HTTPException(422, "Draw something first. Computer vision finishes lines that are already on the board.")
+        step("Looked at the board", f"Measured your {len(req.strokes)} stroke(s) with OpenCV. This mode does not call the AI.")
+        started_cv = time.perf_counter()
+        raw, cv_notes = cv_finish.finish(req.strokes, req.width, req.height)
+        strokes = clean_strokes(raw, req.width, req.height)
+        step("Computer vision", f"Finished the geometry pass in {time.perf_counter() - started_cv:.2f} s.")
+        for line in cv_notes:
+            step("What CV found", line)
+        if not strokes:
+            raise HTTPException(422, "Computer vision didn't find a part to finish. Draw more of the outline, like most of a circle or three sides of a box.")
+        category = {"type": "Drawing", "detail": "the unfinished part of your drawing"}
+        identify(category, "Computer vision completed the missing geometry. No model was asked.")
+        step("Planned the robot", robot_summary(strokes, req.width, req.height))
+        return {"mode": "drawing", "description": "the unfinished part of your drawing",
+                "plan": "Complete partial curves, close gaps, and draw a missing side.",
+                "strokes": strokes, "highlight": [],
+                "checks": 0, "steps": steps, "category": category}
+    if req.action == "drawing" and _REFLECT.search(note):
+        if not req.strokes:
+            raise HTTPException(422, "Draw the side you want reflected first.")
+        step("Looked at the board", f"Measured your {len(req.strokes)} stroke(s). "
+                                    "The reflection is computed from those coordinates.")
+        step("Your instruction", f"\"{note}\"")
+        strokes, highlight, log = _reflected(req)
+        if not strokes:
+            raise HTTPException(422, "Those lines are too small to reflect. Draw the side a bit larger.")
+        for line in log:
+            step("Reflected it", line)
+        description = "a reflection of your drawing"
+        category = {"type": "Drawing", "detail": description}
+        identify(category, "You asked for a reflection, so the green strokes are copied from their right edge out to the right.")
+        step("Planned the robot", robot_summary(strokes, req.width, req.height))
+        return {"mode": "drawing", "description": description,
+                "plan": "Reflect the ink across its right edge, onto the right.",
+                "strokes": strokes, "highlight": highlight, "steps": steps, "category": category}
+
+    step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
+                                f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
+    if req.action == "drawing" and note:
+        step("Your instruction", f"\"{note}\"")
     started = time.perf_counter()
     try:
         ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
-                                  req.image_box)
+                                  req.image_box, req.provider, note if req.action == "drawing" else "")
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     except Exception as e:
@@ -436,14 +673,15 @@ def complete(req: CompleteRequest):
     description = ai.get("description", "")
     names = {"math": "math", "fill": "pattern", "drawing": "drawing", "answer": "a question",
              "hint": "a hint", "check": "checking work"}
-    buttons = {"answer": "Answer", "hint": "Hint", "check": "Check my work", "drawing": "Finish drawing"}
+    buttons = {"answer": "Answer", "work": "Answer but show work", "hint": "Hint",
+               "check": "Check my work", "drawing": "Finish drawing"}
     if req.action in ("hint", "check"):
         step("Decided what to do", f"You pressed {buttons[req.action]}.")
         mode = req.action
     elif req.mode in ("math", "fill", "drawing"):
         if mode != req.mode:
             # The person chose the mode, so that wins over the AI's guess
-            if req.mode == "math" and not ai.get("expression"):
+            if req.mode == "math" and not (ai.get("problems") or ai.get("expression")):
                 raise HTTPException(422, "Couldn't read a math problem there. Try writing it bigger and clearer.")
             if req.mode == "fill" and not ai.get("text"):
                 raise HTTPException(422, "Couldn't find a pattern to continue. Try adding another item or two.")
@@ -457,39 +695,32 @@ def complete(req: CompleteRequest):
         pressed = f"You pressed {buttons[req.action]}. " if req.action in buttons else "Auto mode: "
         step("Decided what to do", f"{pressed}{'The' if pressed.startswith('You') else 'the'} AI classified this as {names.get(mode, mode)}.")
         # Safety net: "1+1" looks like the letter H, so the AI may call math a drawing.
-        # If its math reading is real, solvable math, math wins.
+        # If it also read the strokes as math, math wins, and its own solution is what gets written.
         reading = str(ai.get("math_reading") or "").strip()
-        if mode != "math" and reading and reading.lower() not in ("null", "none"):
-            try:
-                math_solver.solve(reading)
-                ok = any(ch.isdigit() for ch in reading)
-            except Exception:
-                ok = False
-            if ok:
-                step("Changed its mind", f"The strokes also read as  {reading}  which is valid math. "
-                                        "Handwritten math often looks like letters (1+1 looks like H), "
-                                        "so treating it as math instead.")
-                ai.setdefault("problems", [{"expression": reading}])
-                mode = "math"
-        if req.action == "answer" and mode == "drawing":
+        if mode != "math" and reading and reading.lower() not in ("null", "none") and any(ch.isdigit() for ch in reading):
+            step("Changed its mind", f"The strokes also read as  {reading}  which is math. "
+                                    "Handwritten math often looks like letters (1+1 looks like H), "
+                                    "so treating it as math instead.")
+            ai.setdefault("problems", [{"expression": reading, "answer": ai.get("math_answer"),
+                                        "kind": ai.get("math_kind") or "evaluate"}])
+            mode = "math"
+        if req.action in ("answer", "work") and mode == "drawing":
             raise HTTPException(422, "I don't see a problem or question to answer. For pictures, use Finish drawing.")
     step("What it sees", description)
 
     if mode == "math":
         step("AI's notes", ai.get("reasoning"))
         problems = collect_problems(ai, layout)
-        kinds = {"evaluate": "evaluated", "solve": "solved for the unknown",
-                 "blank": "solved for the blank", "check": "checked both sides"}
         strokes, answers, expressions, failed, types = [], [], [], [], []
         pad = 30 if len(problems) == 1 else 12  # tighter when problems sit close together
         for n, prob in enumerate(problems, 1):
             expression = prob["expression"]
             label = f"Problem {n}" if len(problems) > 1 else "The problem"
             try:
-                result = math_solver.solve(expression)
-            except Exception as e:
+                result = math_from_ai(prob, expression)
+            except Exception:
                 failed.append(expression)
-                step(f"{label}: couldn't solve", f"Read it as  {expression}  but SymPy couldn't make sense of it ({e}). Skipping it.")
+                step(f"{label}: couldn't solve", f"Read it as  {expression}  but the AI did not give a solution. Skipping it.")
                 continue
             bbox = locate_math_box(png, prob.get("bbox"), req.strokes, req.width, req.height,
                                    len(problems) == 1, pad)
@@ -499,19 +730,33 @@ def complete(req: CompleteRequest):
             ai_box = prob.get("bbox")
             near_y = ((float(ai_box[1]) + float(ai_box[3])) / 2
                       if ai_box and not _loose_box(ai_box, req.width, req.height) else None)
-            new, where = place_answer(expression, result, bbox, req.width, req.height, board, blank,
-                                      req.strokes, near_y)
+            if req.action == "work":
+                local = ""
+                try:
+                    local = math_solver.show_work(expression)
+                except Exception:
+                    local = ""
+                shown = with_final(local or clean_work(prob.get("work")), result["answer"])
+                new, where = write_steps(shown, bbox, req.width, req.height)
+                if new:
+                    board.add(new)
+                else:
+                    new, where = place_answer(expression, result, bbox, req.width, req.height, board, blank,
+                                              req.strokes, near_y)
+                detail = f"Read  {expression}  and the AI solved it: {result['answer']}. Writing the working {where}."
+                if shown:
+                    detail += "\n" + shown
+            else:
+                new, where = place_answer(expression, result, bbox, req.width, req.height, board, blank,
+                                          req.strokes, near_y)
+                detail = f"Read  {expression}  and the AI solved it: {result['answer']}. Writing it {where}."
             strokes += new
-            try:
-                types.append(math_solver.classify(expression, result))
-            except Exception:
-                types.append(("Math", "equation"))
+            types.append(math_category(expression, result["kind"]))
             answers.append(result["answer"])
             expressions.append(expression)
-            step(f"{label}", f"Read  {expression}  then {kinds.get(result['kind'], 'solved it')} with SymPy "
-                             f"(exact maths, not an AI guess): {result['answer']}. Writing it {where}.")
+            step(f"{label}", detail)
         if not strokes:
-            raise HTTPException(422, f"Read the math as {', '.join(failed) or 'nothing'} but couldn't solve it. "
+            raise HTTPException(422, f"Read the math as {', '.join(failed) or 'nothing'} but the AI didn't give a solution. "
                                      "Try writing it more clearly.")
         kinds_found = sorted({t for t, _ in types})
         if len(types) == 1:
@@ -520,8 +765,8 @@ def complete(req: CompleteRequest):
             category = {"type": kinds_found[0], "detail": f"{len(types)} problems"}
         else:
             category = {"type": "Mixed math", "detail": ", ".join(f"{d} ({t.lower()})" for t, d in types)}
-        identify(category, "Figured out from how SymPy solved it: "
-                 + "; ".join(f"{e} is {t.lower()} ({d})" for e, (t, d) in zip(expressions, types)) + ".")
+        identify(category, "The AI's answer: "
+                 + "; ".join(f"{e} → {a}" for e, a in zip(expressions, answers)) + ".")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
         return {"mode": "math", "description": description, "expression": ";  ".join(expressions),
                 "answer": ", ".join(answers), "strokes": strokes, "steps": steps, "category": category}
@@ -547,6 +792,12 @@ def complete(req: CompleteRequest):
         got = placement.place(board, lambda s: text_writer.text_strokes(text, 0, 0, s, 10 ** 6, "print")[0],
                               fill_spots, placement.shrinking(size, steps=3, factor=0.8), spot_first=True)
         strokes = got.strokes
+        if req.action == "work":
+            rule = clean_work(ai.get("work"))
+            if rule:
+                extra, _, _, _ = write_below(rule, layout, req.width, req.height, board)
+                strokes += extra
+                step("Showed the rule", rule)
         step("Chose what to write", f"Writing {text} next in the sequence {got.where}, {got.size:.0f} px tall to match.")
         numeric = any(ch.isdigit() for ch in text)
         category = {"type": "Number pattern" if numeric else "Pattern", "detail": description or "a sequence to continue"}
@@ -582,26 +833,29 @@ def complete(req: CompleteRequest):
         for n, prob in enumerate(problems, 1):
             label = f"Problem {n}" if len(problems) > 1 else "Your problem"
             shown = prob.get("expression") or f"{prob.get('equation')}  ->  {prob.get('student_answer') or '(no answer)'}"
-            try:
-                result = math_solver.check_work(prob.get("expression"), prob.get("equation"), prob.get("student_answer"))
-            except Exception as e:
-                step(f"{label}: couldn't check", f"Read it as  {shown}  but couldn't check it ({e}).")
-                continue
+            correct = prob.get("correct")
+            if isinstance(correct, str):
+                correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
+            if correct is None and str(prob.get("correct") or "").strip().lower() in ("null", "none", ""):
+                correct = None
+            fix = str(prob.get("correct_answer") or "").strip()
             x1, y1, x2, y2 = refine_bbox(prob.get("bbox") or everything, req.strokes, pad)
             size = min(max((y2 - y1) * 0.85, 28), 120)
-            if result["correct"] is None:
+            if correct is None:
                 empty += 1
                 step(label, f"Read  {shown}  but there's no answer written yet, so nothing to mark.")
                 continue
-            fix = result.get("correct_answer")
+            has_fix = bool(fix) and fix.lower() not in ("null", "none")
 
-            def mark(s, correct=result["correct"], fix=fix):
+            def mark(s, correct=correct, fix=fix, has_fix=has_fix):
                 """A check, or an X with the right answer beside it, drawn at the origin."""
                 if correct:
                     return handwriting.text_to_strokes("✓", 0, 0, s)
+                cross = handwriting.text_to_strokes("✗", 0, 0, s)
+                if not has_fix:
+                    return cross
                 cap = s * 0.55
-                return (handwriting.text_to_strokes("✗", 0, 0, s)
-                        + text_writer.text_strokes(fix, s * 0.95, (s - cap) / 2, cap, 10 ** 6, "print")[0])
+                return cross + text_writer.text_strokes(fix, s * 0.95, (s - cap) / 2, cap, 10 ** 6, "print")[0]
 
             def mark_spots(s, bw, bh, x1=x1, y1=y1, x2=x2, y2=y2):
                 gap = placement.GAP
@@ -613,18 +867,18 @@ def complete(req: CompleteRequest):
             got = placement.place(board, mark, mark_spots, placement.shrinking(size, steps=3, factor=0.8),
                                   spot_first=True)
             strokes += got.strokes
-            if result["correct"]:
+            if correct:
                 right += 1
-                step(label, f"Read  {shown}  and checked it with SymPy: correct. Marked it with a check {got.where}.")
+                step(label, f"Read  {shown}  and the AI checked it: correct. Marked it with a check {got.where}.")
             else:
                 wrong += 1
-                step(label, f"Read  {shown}  and checked it with SymPy: not quite. The right answer is {fix}, "
-                            f"so it gets an X with the correct answer, {got.where}.")
+                step(label, f"Read  {shown}  and the AI checked it: not quite. The right answer is {fix or 'different'}, "
+                            f"so it gets an X{' with the correct answer' if has_fix else ''}, {got.where}.")
         total = right + wrong
         if not total:
             raise HTTPException(422, "I didn't find any finished answers to check. Write your answer after the = sign.")
         category = {"type": "Check", "detail": f"{right} of {total} correct" + (f", {empty} not answered yet" if empty else "")}
-        identify(category, "You asked to check your work, so each answer was verified with exact maths.")
+        identify(category, "You asked to check your work, so the AI marked each answer.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
         return {"mode": "check", "description": description, "answer": category["detail"], "strokes": strokes,
                 "steps": steps, "category": category}
@@ -634,22 +888,18 @@ def complete(req: CompleteRequest):
         step("Read the question", f"\"{question}\"")
         step("How it answered", ai.get("reasoning"))
         answer = str(ai.get("answer", "")).strip()
-        calc = ai.get("calculation")
-        if calc and str(calc).lower() not in ("null", "none"):
-            try:
-                solved = math_solver.solve(str(calc))
-                result = solved["answer"]
-                note = " There are no real solutions, so these are complex numbers (i = square root of -1)." if solved.get("complex") else ""
-                step("Solved it exactly", f"Computed {calc} with SymPy (exact, not an AI guess): {result}.{note}")
-                if "{calc}" in answer and "=" in result and answer.rstrip().endswith("= {calc}"):
-                    result = result.split("=", 1)[1]  # "x = {calc}" + "x=2" -> "x = 2"
-            except Exception:
-                result = str(ai.get("calc_guess", "?"))
-            answer = answer.replace("{calc}", result) if "{calc}" in answer else f"{answer} {result}".strip()
-        answer = answer.replace("{calc}", str(ai.get("calc_guess", "")))
         if not answer:
             raise HTTPException(422, "The AI didn't come up with an answer. Try writing the question more clearly.")
-        ink = vision.ink_bbox(png, None) if not req.strokes else None
+        if req.action == "work":
+            local = ""
+            try:
+                local = math_solver.show_work(question)
+            except Exception:
+                local = ""
+            answer_text = with_final(local or clean_work(ai.get("work")), answer)
+        else:
+            answer_text = answer
+        ink = vision.ink_bbox(png, None) if not req.strokes and req.action != "work" else None
         if ink and re.fullmatch(r"=?\s*[\d./+\-xXi]+", answer.replace(" ", "")):
             shown = answer[1:].strip() if answer.startswith("=") else answer
             strokes, where = place_answer("problem", {"kind": "evaluate", "answer": shown}, ink,
@@ -661,10 +911,11 @@ def complete(req: CompleteRequest):
                 step("Planned the robot", robot_summary(strokes, req.width, req.height))
                 return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
                         "steps": steps, "category": category}
-        strokes, size, written, where = write_below(answer, layout, req.width, req.height, board)
+        strokes, size, written, where = write_below(answer_text, layout, req.width, req.height, board)
         if not strokes:
             raise HTTPException(422, "There's no room left on the board for the answer.")
-        step("Wrote the answer", f"\"{answer}\" {where.replace('your work', 'your question')}, "
+        wrote = "the working" if req.action == "work" else f"\"{answer}\""
+        step("Wrote the answer", f"{wrote} {where.replace('your work', 'your question')}, "
                                  f"{size:.0f} px tall, in {written} line(s).")
         category = {"type": "Question", "detail": question}
         identify(category, "It's written words asking something, so the robot answers it instead of solving or drawing.")
@@ -674,42 +925,87 @@ def complete(req: CompleteRequest):
 
     step("Made a plan", ai.get("plan"))
     log = []
-    strokes = clean_strokes(shapes.build_strokes(ai, req.strokes, log), req.width, req.height)
-    if req.review and strokes:
-        started = time.perf_counter()
-        try:
-            summary = shapes.summarize_strokes(req.strokes)
-            fix = vision.review_drawing(png, req.strokes, strokes, summary, ai)
+    board = (req.width, req.height)
+    strokes = clean_strokes(shapes.build_strokes(ai, req.strokes, log, board), req.width, req.height)
+    highlight = shapes.highlight_ids()
+    checks = 0
+    # Two checklist passes. A yes on the first one does not skip the second.
+    check_limit = 2
+    if not strokes and req.strokes:
+        step("First version", "The first shapes produced no lines"
+             + (": " + " ".join(log) if log else ".")
+             + " Sending the board back and asking again.")
+    if req.review and (strokes or req.strokes):
+        summary = shapes.summarize_strokes(req.strokes)
+        previous = ai
+        sure = False
+        for n in range(1, check_limit + 1):
+            checks = n
+            started = time.perf_counter()
+            try:
+                fix = vision.review_drawing(png, req.strokes, strokes, summary, previous, req.provider,
+                                            n, check_limit)
+            except Exception as e:
+                step(f"Check {n} of {check_limit}", f"This check failed ({e}). Asking again.")
+                continue
             took = f"{time.perf_counter() - started:.1f} s"
-            if fix.get("ok") is False and (fix.get("shapes") or fix.get("strokes")):
-                fixed_log = []
-                fixed = clean_strokes(shapes.build_strokes(fix, req.strokes, fixed_log), req.width, req.height)
-                if fixed:
-                    strokes, log = fixed, fixed_log
-                    step("Double-checked the drawing", f"Looked at its own result and fixed it ({took}): "
-                                                       f"{fix.get('review') or 'adjusted the shapes'}")
-                    if fix.get("plan"):
-                        step("Updated the plan", fix["plan"])
-                else:
-                    step("Double-checked the drawing", f"Tried a fix but it came out empty, so kept the first version ({took}).")
+            verdict = (fix.get("review") or "").strip()
+            rows = fix.get("checklist") if isinstance(fix.get("checklist"), list) else []
+            listed = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                flag = row.get("pass")
+                passed = flag is True or (isinstance(flag, str) and flag.strip().lower() in ("true", "yes", "pass"))
+                item = str(row.get("item") or "Item").strip()
+                note_text = str(row.get("note") or "").strip()
+                listed.append(f"{'PASS' if passed else 'FAIL'} — {item}" + (f": {note_text}" if note_text else ""))
+            if not listed:
+                listed.append("FAIL — Checklist: the model did not answer the five items.")
+            ok = fix.get("ok")
+            sure = (ok is True or (isinstance(ok, str) and ok.strip().lower() in ("true", "yes"))) and strokes
+            sure = sure and listed and all(line.startswith("PASS") for line in listed)
+            report = "\n".join(listed)
+            if verdict:
+                report += f"\n{verdict}"
+            if sure:
+                step(f"Check {n} of {check_limit}", f"Yes ({took}).\n{report}")
+                continue
+            sure = False
+            fixed_log = []
+            fixed = clean_strokes(shapes.build_strokes(fix, req.strokes, fixed_log, board), req.width, req.height)
+            if fixed:
+                strokes, log = fixed, fixed_log
+                highlight = shapes.highlight_ids()
+                previous = fix
+                step(f"Check {n} of {check_limit}", f"No ({took}). Applied the changes.\n{report}")
             else:
-                step("Double-checked the drawing", f"Looked at its own result and it looked right ({took}). "
-                                                   f"{fix.get('review') or ''}".strip())
-        except Exception as e:
-            step("Double-checked the drawing", f"Skipped the double-check ({e}).")
-    for note in log:
-        step("Cleaned up the drawing", note)
+                step(f"Check {n} of {check_limit}", f"No ({took}). Kept this version.\n{report}")
+        step("Check count", f"{checks} checks. " + ("The last checklist passed." if sure else "The last checklist did not pass."))
+    elif not strokes and req.strokes and _REFLECT.search(note):
+        strokes, highlight, reflect_log = _reflected(req)
+        log = reflect_log or log
+    for line in log:
+        step("Cleaned up the drawing", line)
     if not strokes:
-        raise HTTPException(422, "The AI couldn't figure out how to finish this drawing. Try adding a bit more.")
+        why = " ".join(log) if log else "The shapes did not turn into any lines."
+        raise HTTPException(422, f"The AI couldn't figure out how to finish this drawing. {why}")
     category = {"type": "Drawing", "detail": description or "a picture to finish"}
     identify(category, "It's a picture rather than numbers or symbols, so it gets finished with shapes.")
     step("Planned the robot", robot_summary(strokes, req.width, req.height))
     return {"mode": "drawing", "description": description, "plan": ai.get("plan", ""),
-            "strokes": strokes, "steps": steps, "category": category}
+            "strokes": strokes, "highlight": highlight, "checks": checks, "steps": steps, "category": category}
 
 
 @app.post("/api/write")
 def write_text(req: WriteRequest):
+    started = time.perf_counter()
+    result = _write_text(req)
+    boards.remember(result, source="write", seconds=time.perf_counter() - started)
+    return result
+
+
+def _write_text(req: WriteRequest):
     text = req.text.strip()[:400]
     if not text:
         raise HTTPException(400, "Type something for the robot to write first.")
@@ -735,6 +1031,14 @@ def write_text(req: WriteRequest):
 
 @app.post("/api/ask")
 def ask(req: AskRequest):
+    started = time.perf_counter()
+    result = _ask(req)
+    boards.remember(result, source="ask", provider=req.provider, user_strokes=req.strokes,
+                    heard=req.prompt, seconds=time.perf_counter() - started)
+    return result
+
+
+def _ask(req: AskRequest):
     prompt = req.prompt.strip()[:500]
     if not prompt:
         raise HTTPException(400, "Type a question or instruction first.")
@@ -755,69 +1059,116 @@ def ask(req: AskRequest):
 
     started = time.perf_counter()
     try:
-        ai = vision.ask(prompt, png, req.strokes, (x, ay), box)
+        ai = vision.ask(prompt, png, req.strokes, (x, ay), box, req.provider)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
-    steps.append({"title": "Asked the AI", "detail": f"Sent your prompt and a picture of the board to {vision.provider_name()}. "
+    steps.append({"title": "Asked the AI", "detail": f"Sent your prompt and a picture of the board to {vision.provider_name(req.provider)}. "
                                                     f"It answered in {time.perf_counter() - started:.1f} s."})
+    return _from_prompt(ai, prompt, x, ay, size, style, req.width, req.height, steps, prompt_strokes, req.strokes)
 
-    if ai.get("kind") == "drawing":
-        if ai.get("description"):
-            steps.append({"title": "Decided to draw", "detail": ai["description"]})
-        log = []
-        strokes = clean_strokes(shapes.build_strokes({"shapes": ai.get("shapes")}, [], log), req.width, req.height)
-        for note in log:
-            steps.append({"title": "Made the drawing", "detail": note})
-        if not strokes:
-            raise HTTPException(422, "The AI couldn't work out how to draw that. Try describing it differently.")
-        steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, req.width, req.height)})
-        return {"mode": "drawing", "description": ai.get("description", "a drawing"), "answer": "", "strokes": strokes,
-                "prompt_strokes": prompt_strokes, "steps": steps,
-                "category": {"type": "Drawing", "detail": ai.get("description", prompt)}}
 
-    answer = str(ai.get("answer", "")).strip()
-    if ai.get("reasoning"):
-        steps.append({"title": "How it answered", "detail": ai["reasoning"]})
-    calc = ai.get("calculation")
-    if calc and str(calc).lower() not in ("null", "none"):
+@app.post("/api/transcribe")
+def transcribe_clip(req: TranscribeRequest):
+    """Live caption while the person is still talking. Empty audio is not an error."""
+    raw = req.audio.split(",", 1)[1] if req.audio.startswith("data:") else req.audio
+    try:
+        audio = base64.b64decode(raw)
+    except Exception:
+        raise HTTPException(400, "That recording isn't valid audio.")
+    if len(audio) < 400:
+        return {"text": ""}
+    try:
+        heard = vision.transcribe(audio, req.mime)
+    except RuntimeError as e:
+        if "didn't catch" in str(e):
+            return {"text": ""}
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"ElevenLabs request failed: {e}")
+    return {"text": heard}
+
+
+@app.post("/api/speak")
+def speak(req: SpeakRequest):
+    started = time.perf_counter()
+    result = _speak(req)
+    boards.remember(result, source="speak", provider=req.provider, user_strokes=req.strokes,
+                    seconds=time.perf_counter() - started)
+    return result
+
+
+def _speak(req: SpeakRequest):
+    raw = req.audio.split(",", 1)[1] if req.audio.startswith("data:") else req.audio
+    try:
+        audio = base64.b64decode(raw)
+    except Exception:
+        raise HTTPException(400, "That recording isn't valid audio.")
+    if len(audio) < 800:
+        raise HTTPException(400, "That recording was too short. Hold Talk and say what to draw.")
+    if len(audio) > 8_000_000:
+        raise HTTPException(400, "That recording is too long. Keep it under about 20 seconds.")
+    data = req.image.split(",", 1)[1] if req.image.startswith("data:") else req.image
+    png = base64.b64decode(data)
+    heard = req.text.strip()[:500]
+    if heard:
+        steps = [{"title": "Heard you", "detail": f"\"{heard}\""}]
+    else:
+        started = time.perf_counter()
         try:
-            solved = math_solver.solve(str(calc))
-            result = solved["answer"]
-            note = " No real solutions, so these are complex numbers (i = square root of -1)." if solved.get("complex") else ""
-            steps.append({"title": "Double-checked the maths", "detail": f"Computed {calc} with SymPy (exact, not an AI guess): {result}.{note}"})
-            if "=" in result and answer.rstrip().endswith("= {calc}"):
-                result = result.split("=", 1)[1]
+            heard = vision.transcribe(audio, req.mime)
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"ElevenLabs request failed: {e}")
+        steps = [{"title": "Heard you", "detail": f"ElevenLabs transcribed: \"{heard}\" in {time.perf_counter() - started:.1f} s."}]
+    box = _open_box(req.strokes, req.width, req.height)
+    x, y = box[0], box[1]
+    size = min(max(req.size, 16), 80)
+    style = req.style if req.style in text_writer.STYLES else "print"
+    started = time.perf_counter()
+    try:
+        ai = vision.ask(heard, png, req.strokes, (x, y), box, req.provider, vision.SPEAK_PROMPT)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"AI request failed: {e}")
+    steps.append({"title": "Turned it into a drawing",
+                  "detail": f"Sent \"{heard}\" to {vision.provider_name(req.provider)}. "
+                            f"It answered in {time.perf_counter() - started:.1f} s."})
+    problem_strokes = []
+    if ai.get("kind") != "drawing":
+        problem = str(ai.get("problem") or heard).strip()
+        problem = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in problem)
+        problem = re.sub(r"\s+", " ", problem).strip()[:120]
+        expr = problem.rstrip("=").strip()
+        solved_value = None
+        try:
+            solved = math_solver.solve(expr)
+            if solved.get("kind") == "evaluate" and solved.get("answer"):
+                solved_value = solved["answer"]
+                ai["answer"] = solved_value
+                if not problem.endswith("="):
+                    problem = f"{problem} ="
         except Exception:
-            result = str(ai.get("calc_guess", "?"))
-            steps.append({"title": "Double-checked the maths", "detail": f"SymPy couldn't parse {calc}, so using the AI's own result: {result}."})
-        answer = answer.replace("{calc}", result) if "{calc}" in answer else answer
-    answer = answer.replace("{calc}", str(ai.get("calc_guess", "")))
-    if not answer:
-        raise HTTPException(422, "The AI didn't come up with an answer. Try rephrasing your prompt.")
-
-    board = placement.Board(req.width, req.height, req.strokes + prompt_strokes)
-    pbox = placement.bounds(prompt_strokes) if prompt_strokes else (x, y, x, y)
-
-    def ask_spots(s, bw, bh):
-        gap = placement.GAP
-        return [(x, max(ay, pbox[3] + gap), "under your prompt"),
-                (pbox[2] + max(s, gap), pbox[1], "to the right of your prompt"),
-                (x, pbox[1] - bh - max(s * 0.35, gap), "above your prompt")]
-
-    got = placement.place(board, lambda s: text_writer.text_strokes(answer, 0, 0, s, max(req.width - x - 20, s * 3),
-                                                                    style)[0],
-                          ask_spots, placement.shrinking(size))
-    strokes = got.strokes
-    if not strokes:
-        raise HTTPException(422, "There's no room to write there. Try clicking higher up on the board.")
-    written = len(text_writer.wrap(answer, style, got.size, max(req.width - x - 20, got.size * 3)))
-    steps.append({"title": "Wrote the answer", "detail": f"\"{answer}\" {got.where}, in {written} line(s), "
-                                                         "using a single-stroke pen font."})
-    steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, req.width, req.height)})
-    return {"mode": "answer", "description": prompt, "answer": answer, "strokes": strokes,
-            "prompt_strokes": prompt_strokes, "steps": steps, "category": {"type": "Answer", "detail": prompt}}
+            pass
+        if problem:
+            wrap_w = max(req.width - x - 20, size * 3)
+            problem_strokes, lines, _ = text_writer.text_strokes(
+                problem, x, y, size, wrap_w, "print", req.height - 10)
+            if problem_strokes and lines:
+                y = min(y + lines * size * text_writer.LINE_GAP + size * 0.35, req.height - size * 1.4)
+                steps.append({"title": "Restated the problem", "detail": f"Writing \"{problem}\" on the board, then the answer under it."})
+                ai["problem"] = problem
+    result = _from_prompt(ai, heard, x, y, size, style, req.width, req.height, steps, [],
+                          list(req.strokes) + problem_strokes)
+    if problem_strokes:
+        result["strokes"] = problem_strokes + result["strokes"]
+        if solved_value and result.get("answer"):
+            result["answer"] = f"{expr} = {solved_value}"
+    result["_heard"] = heard
+    return result
 
 
 @app.post("/api/trace")
@@ -846,6 +1197,21 @@ def trace_image(req: TraceRequest):
     ]
     return {"mode": "trace", "description": "your image", "answer": "", "strokes": strokes, "steps": steps,
             "category": {"type": "Image trace", "detail": f"{info['method']}, {req.detail} detail"}}
+
+
+@app.get("/api/boards")
+def recent_boards():
+    return {"configured": boards.configured(), "boards": boards.list_boards()}
+
+
+@app.get("/api/boards/{board_id}")
+def one_board(board_id: str):
+    if not boards.configured():
+        raise HTTPException(503, "Add MONGODB_URI to backend/.env, save the file, and try again.")
+    doc = boards.get_board(board_id)
+    if not doc:
+        raise HTTPException(404, "That saved board is gone.")
+    return doc
 
 
 @app.post("/api/gcode", response_class=PlainTextResponse)

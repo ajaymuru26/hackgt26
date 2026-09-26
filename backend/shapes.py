@@ -17,20 +17,153 @@ STEP = 12  # pixels between points along curves
 
 
 _ANCHORS: ContextVar[dict] = ContextVar("anchors", default={})
+_BOXES: ContextVar[dict] = ContextVar("boxes", default={})
+_HIGHLIGHT: ContextVar[list] = ContextVar("highlight", default=[])
+_BOARD: ContextVar[tuple] = ContextVar("board", default=(1200, 700))
 
 
 def _pt(p) -> Point:
-    """A point is [x, y], or an anchor name like "K7" or "S2.end" that points at the person's ink."""
+    """A point is [x, y], an anchor like "K7", or a corner of the measured box like "TL".
+
+    x and y may also be expressions of the measured box, such as "T-0.5*W".
+    """
     if isinstance(p, str):
         key = p.strip().replace(" ", "")
         anchors = _ANCHORS.get()
         if key in anchors:
             return list(anchors[key])
+        corners = _BOXES.get().get("_corners", {})
+        if key in corners:
+            return list(corners[key])
         m = re.fullmatch(r"[Ss](\d+)", key)  # bare "S2" -> its centre
         if m and f"S{m.group(1)}.center" in anchors:
             return list(anchors[f"S{m.group(1)}.center"])
         raise KeyError(f"unknown anchor {p}")
-    return [float(p[0]), float(p[1])]
+    return [_measure(p[0]), _measure(p[1])]
+
+
+def _measure(value) -> float:
+    """A number, or an expression using the measured box: L, T, R, B, W, H, CX, CY, S0.W, ..."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(" ", "")
+    if not text:
+        raise ValueError("empty measure")
+    env = _BOXES.get().get("_env", {})
+    return _eval_measure(text, env)
+
+
+def _eval_measure(text: str, env: dict) -> float:
+    """+ - * / and parentheses only, so a placement is arithmetic on the real coordinates."""
+    i = 0
+
+    def peek():
+        return text[i] if i < len(text) else ""
+
+    def parse_add():
+        nonlocal i
+        v = parse_mul()
+        while i < len(text) and text[i] in "+-":
+            op = text[i]
+            i += 1
+            r = parse_mul()
+            v = v + r if op == "+" else v - r
+        return v
+
+    def parse_mul():
+        nonlocal i
+        v = parse_unary()
+        while i < len(text) and text[i] in "*/":
+            op = text[i]
+            i += 1
+            r = parse_unary()
+            if op == "/" and r == 0:
+                raise ValueError("divide by zero")
+            v = v * r if op == "*" else v / r
+        return v
+
+    def parse_unary():
+        nonlocal i
+        if peek() == "-":
+            i += 1
+            return -parse_unary()
+        if peek() == "+":
+            i += 1
+            return parse_unary()
+        return parse_atom()
+
+    def parse_atom():
+        nonlocal i
+        if peek() == "(":
+            i += 1
+            v = parse_add()
+            if peek() != ")":
+                raise ValueError(text)
+            i += 1
+            return v
+        start = i
+        if peek().isdigit() or peek() == ".":
+            i += 1
+            while i < len(text) and (text[i].isdigit() or text[i] == "."):
+                i += 1
+            return float(text[start:i])
+        while i < len(text) and (text[i].isalnum() or text[i] in "._"):
+            i += 1
+        name = text[start:i]
+        if name not in env:
+            raise ValueError(f"unknown measure {name}")
+        return float(env[name])
+
+    value = parse_add()
+    if i != len(text):
+        raise ValueError(text)
+    return value
+
+
+def _stroke_box(stroke: Stroke) -> dict:
+    xs, ys = [p[0] for p in stroke], [p[1] for p in stroke]
+    L, T, R, B = min(xs), min(ys), max(xs), max(ys)
+    return {"L": L, "T": T, "R": R, "B": B, "W": R - L, "H": B - T,
+            "CX": (L + R) / 2, "CY": (T + B) / 2}
+
+
+def measure_boxes(user_strokes: list[Stroke]) -> dict:
+    """Exact frame of the ink, and of each stroke. Placements are computed from these."""
+    boxes, env, corners = {}, {}, {}
+    pts = [p for s in user_strokes for p in s]
+    if pts:
+        boxes["ALL"] = _stroke_box(pts)
+        env.update(boxes["ALL"])
+        b = boxes["ALL"]
+        corners.update({
+            "TL": [b["L"], b["T"]], "TR": [b["R"], b["T"]],
+            "BL": [b["L"], b["B"]], "BR": [b["R"], b["B"]],
+            "TC": [b["CX"], b["T"]], "BC": [b["CX"], b["B"]],
+            "LC": [b["L"], b["CY"]], "RC": [b["R"], b["CY"]],
+            "C": [b["CX"], b["CY"]],
+        })
+    for i, s in enumerate(user_strokes):
+        if len(s) < 2:
+            continue
+        box = _stroke_box(s)
+        boxes[f"S{i}"] = box
+        for key, val in box.items():
+            env[f"S{i}.{key}"] = val
+    boxes["_env"] = env
+    boxes["_corners"] = corners
+    return boxes
+
+
+def _target_box(shape: dict) -> dict:
+    boxes = _BOXES.get()
+    which = str(shape.get("on") or "ALL").strip()
+    which = which.upper() if which.upper() == "ALL" else which[0].upper() + which[1:]
+    if which.startswith("s"):
+        which = "S" + which[1:]
+    box = boxes.get(which) or boxes.get("ALL")
+    if not box or "W" not in box or box["W"] < 1 or box["H"] < 1:
+        raise ValueError("no measured box")
+    return box
 
 
 def anchor_points(user_strokes: list[Stroke], max_corners=90):
@@ -83,6 +216,15 @@ def summarize_strokes(user_strokes: list[Stroke], max_strokes=60, max_points=12)
             f"S{i}: start ({round(s[0][0])},{round(s[0][1])}) end ({round(s[-1][0])},{round(s[-1][1])}) "
             f"bbox [{round(min(xs))},{round(min(ys))},{round(max(xs))},{round(max(ys))}] corners {corners} path {path_txt}"
         )
+    frame = measure_boxes(user_strokes).get("ALL")
+    if frame:
+        lines.append(
+            "MEASURED FRAME (exact; place new parts from these, do not guess pixels): "
+            f"L={frame['L']:.1f} T={frame['T']:.1f} R={frame['R']:.1f} B={frame['B']:.1f} "
+            f"W={frame['W']:.1f} H={frame['H']:.1f} CX={frame['CX']:.1f} CY={frame['CY']:.1f}. "
+            "Corners TL TR BL BR, edge midpoints TC BC LC RC, centre C. "
+            "S0.L S0.T S0.W and so on are that stroke's own box."
+        )
     if len(user_strokes) > max_strokes:
         lines.append(f"... and {len(user_strokes) - max_strokes} more strokes")
     return "\n".join(lines)
@@ -116,66 +258,95 @@ def bezier(ctrl: list[Point]) -> Stroke:
     return pts
 
 
-def _flip(stroke: Stroke, axis: str, at: float) -> Stroke:
-    if axis == "horizontal":
-        return [[p[0], 2 * at - p[1]] for p in stroke]
-    return [[2 * at - p[0], p[1]] for p in stroke]
-
-
-def _refine_axis(chosen: list[Stroke], all_strokes: list[Stroke], axis: str, guess: float) -> float:
-    """The AI's mirror line is approximate. Try nearby lines and keep the one where the
-    flipped strokes' ends land on the person's real line ends/corners (halves meet cleanly)."""
-    anchors = [p for s in all_strokes if s for p in simplify(s)]
-    ends = [p for s in chosen if s for p in (s[0], s[-1])]
-    if not anchors or not ends:
-        return guess
-    k = 1 if axis == "horizontal" else 0
-
-    def cost(at):
-        total = 0.0
-        for p in ends:
-            q = list(p)
-            q[k] = 2 * at - q[k]
-            total += min(min(math.dist(q, a) for a in anchors), 30)
-        return total + abs(at - guess) * 0.05  # tiny preference for the AI's guess
-
-    best = min((guess + d for d in range(-60, 61)), key=cost)
-    fine = min((best + d / 4 for d in range(-4, 5)), key=cost)
-    return fine
-
-
-def _straddles(stroke: Stroke, axis: str, at: float, margin=15) -> bool:
-    """True if a stroke sits across the mirror line (like an eye or nose in the middle)."""
-    k = 1 if axis == "horizontal" else 0
-    vals = [p[k] for p in stroke]
-    return min(vals) < at - margin and max(vals) > at + margin
+def highlight_ids() -> list[int]:
+    """Stroke indexes the last mirror marked, so the board can draw them in green."""
+    return list(_HIGHLIGHT.get())
 
 
 def mirror(user_strokes: list[Stroke], ids, axis: str, at: float, log=None) -> list[Stroke]:
-    if ids == "all" or ids is None:
-        chosen = list(user_strokes)
+    """Flip the chosen strokes and park the copy beside them.
+
+    The fold is the right edge of the ink, not its middle. A left half of a face
+    is copied onto the right of that edge, so the missing side sits beside it.
+    """
+    horizontal = str(axis).lower() == "horizontal"
+    if isinstance(ids, (int, float)):
+        ids = [ids]
+    elif isinstance(ids, str):
+        ids = "all" if ids.strip().lower() == "all" else re.findall(r"\d+", ids)
+    if ids == "all" or ids is None or ids == []:
+        chosen_i = list(range(len(user_strokes)))
     else:
-        chosen = []
+        chosen_i = []
         for i in ids:
-            try:
-                idx = int(str(i).strip().lstrip("Ss"))
-            except ValueError:
+            found = re.findall(r"\d+", str(i))
+            if not found:
                 continue
-            if 0 <= idx < len(user_strokes):
-                chosen.append(user_strokes[idx])
-    chosen = [s for s in chosen if len(s) >= 2]
-    guess = at
-    at = _refine_axis(chosen, user_strokes, axis, at)
-    # Strokes crossing the middle are already symmetric-ish; flipping them makes a double image.
-    kept = [s for s in chosen if not _straddles(s, axis, at)]
+            idx = int(found[0])
+            if 0 <= idx < len(user_strokes) and idx not in chosen_i:
+                chosen_i.append(idx)
+        if not chosen_i:
+            chosen_i = list(range(len(user_strokes)))
+    chosen_i = [i for i in chosen_i if len(user_strokes[i]) >= 2]
+    chosen = [user_strokes[i] for i in chosen_i]
+    if not chosen:
+        return []
+    _HIGHLIGHT.get().extend(chosen_i)
+
+    xs = [p[0] for s in chosen for p in s]
+    ys = [p[1] for s in chosen for p in s]
+    left, right = min(xs), max(xs)
+    top, bottom = min(ys), max(ys)
+    board_w, board_h = _BOARD.get()
+    gap, margin = 48.0, 8.0
+
+    if horizontal:
+        # The bottom of the selection maps to the far side of the copy.
+        far = 2 * top - bottom - gap
+        if far >= margin:
+            def flip_y(y, g=gap):
+                return 2 * top - y - g
+            where = f"above it, from the bottom y={bottom:.0f} up to y={far:.0f}"
+        else:
+            far = 2 * bottom - top + gap
+            if far > board_h - margin:
+                gap = max(24.0, gap - (far - (board_h - margin)))
+                far = 2 * bottom - top + gap
+
+            def flip_y(y, g=gap):
+                return 2 * bottom - y + g
+            where = f"below it (no room above), from y={top:.0f} down to y={far:.0f}"
+        out = [[[p[0], flip_y(p[1])] for p in s] for s in chosen]
+    else:
+        # Fold at the right edge. The left side they drew stays put, and the
+        # copy (the other side) starts just to the right of that edge.
+        far = 2 * right - left + gap
+        if far > board_w - margin:
+            gap = (board_w - margin) - (2 * right - left)
+        if gap >= 16:
+            far = 2 * right - left + gap
+
+            def flip_x(x, g=gap):
+                return 2 * right - x + g
+            where = f"to its right, from the right edge x={right:.0f} out to x={far:.0f}"
+        else:
+            gap = 48.0
+            far = 2 * left - right - gap
+            if far < margin:
+                gap = max(16.0, left - margin - (right - left))
+                far = 2 * left - right - gap
+
+            def flip_x(x, g=gap):
+                return 2 * left - x - g
+            where = f"to its left (no room on the right), from x={right:.0f} to x={far:.0f}"
+        out = [[[flip_x(p[0]), p[1]] for p in s] for s in chosen]
+
     if log is not None:
-        line = "x" if axis != "horizontal" else "y"
-        note = (f"Mirrored {len(kept)} of your strokes across {line} = {at:.0f}"
-                + (f" (the AI guessed {guess:.0f}; adjusted so the halves meet)" if abs(at - guess) >= 2 else ""))
-        if len(kept) < len(chosen):
-            note += f". Skipped {len(chosen) - len(kept)} stroke(s) sitting on the centre line"
-        log.append(note + ".")
-    return [_flip(s, axis, at) for s in kept]
+        log.append(
+            f"Highlighted {len(chosen)} stroke(s) in green, then reflected them {where}. "
+            "The copy sits beside the original, not across the middle, so both sides stay visible."
+        )
+    return out
 
 
 def shape_to_strokes(shape: dict, user_strokes: list[Stroke], log=None) -> list[Stroke]:
@@ -188,29 +359,55 @@ def shape_to_strokes(shape: dict, user_strokes: list[Stroke], log=None) -> list[
             pts.append(pts[0])
         return [pts]
     if kind == "rect":
-        x, y, w, h = (float(shape[k]) for k in ("x", "y", "w", "h"))
+        x, y = _measure(shape["x"]), _measure(shape["y"])
+        w, h = _measure(shape["w"]), _measure(shape["h"])
         return [[[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]]]
+    if kind == "roof":
+        b = _target_box(shape)
+        peak = [b["CX"], b["T"] - 0.5 * b["W"]]
+        if log is not None:
+            log.append(f"Roof from the measured top edge ({b['L']:.0f},{b['T']:.0f})–({b['R']:.0f},{b['T']:.0f}), "
+                       f"peak at ({peak[0]:.0f},{peak[1]:.0f}), which is half the width above the top.")
+        return [[[b["L"], b["T"]], peak, [b["R"], b["T"]]]]
+    if kind == "door":
+        b = _target_box(shape)
+        w, h = b["W"] / 3, b["H"] / 2
+        x, y = b["CX"] - w / 2, b["B"] - h
+        if log is not None:
+            log.append(f"Door width W/3 and height H/2, centred, bottom flush with y={b['B']:.0f}.")
+        return [[[x, y], [x + w, y], [x + w, y + h], [x, y + h]]]
+    if kind == "window":
+        b = _target_box(shape)
+        side = b["W"] / 5
+        x, y = b["CX"] - side / 2, b["T"] + b["H"] * 0.22
+        if log is not None:
+            log.append(f"Window side W/5, centred in the upper part of the measured box.")
+        return [[[x, y], [x + side, y], [x + side, y + side], [x, y + side], [x, y]]]
     if kind == "circle":
         cx, cy = _pt(shape["center"])
-        r = float(shape["r"])
+        r = _measure(shape["r"])
         return [ellipse_arc(cx, cy, r, r, 0, 360)]
     if kind == "ellipse":
         cx, cy = _pt(shape["center"])
-        return [ellipse_arc(cx, cy, float(shape["rx"]), float(shape["ry"]), 0, 360)]
+        return [ellipse_arc(cx, cy, _measure(shape["rx"]), _measure(shape["ry"]), 0, 360)]
     if kind == "arc":
         cx, cy = _pt(shape["center"])
         r = shape.get("r")
-        rx = float(shape.get("rx", r))
-        ry = float(shape.get("ry", r))
-        return [ellipse_arc(cx, cy, rx, ry, float(shape["start"]), float(shape["end"]))]
+        rx = _measure(shape.get("rx", r))
+        ry = _measure(shape.get("ry", r))
+        return [ellipse_arc(cx, cy, rx, ry, _measure(shape["start"]), _measure(shape["end"]))]
     if kind == "curve":
         ctrl = [_pt(p) for p in shape["points"]]
         if len(ctrl) < 3:
             return [ctrl]
         return [bezier(ctrl)]
-    if kind == "mirror":
+    if kind in ("mirror", "reflect", "reflection", "flip"):
+        try:
+            at = float(shape.get("at", 0))
+        except (TypeError, ValueError):
+            at = 0.0
         return mirror(user_strokes, shape.get("strokes", "all"),
-                      str(shape.get("axis", "vertical")).lower(), float(shape["at"]), log)
+                      str(shape.get("axis", "vertical")).lower(), at, log)
     if kind == "stroke" or ("points" in shape and not kind):
         return [[_pt(p) for p in shape["points"]]]
     return []
@@ -290,19 +487,27 @@ def snap_endpoints(new_strokes: list[Stroke], user_strokes: list[Stroke],
     return out
 
 
-def build_strokes(ai: dict, user_strokes: list[Stroke], log=None) -> list[Stroke]:
+def build_strokes(ai: dict, user_strokes: list[Stroke], log=None, board=(1200, 700)) -> list[Stroke]:
     """Everything the AI asked for, as strokes, with duplicates removed and ends snapped."""
-    new, kinds, bad = [], {}, 0
+    new, mirrored, kinds, bad = [], [], {}, 0
+    _HIGHLIGHT.set([])
+    _BOARD.set((float(board[0]), float(board[1])))
     _ANCHORS.set(anchor_points(user_strokes)[0])
+    _BOXES.set(measure_boxes(user_strokes))
     for shape in ai.get("shapes") or []:
+        if not isinstance(shape, dict):
+            bad += 1
+            continue
         try:
             made = shape_to_strokes(shape, user_strokes, log)
-        except (KeyError, TypeError, ValueError, IndexError):
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError):
             made = []
         if made:
-            new.extend(made)
             k = str(shape.get("type", "shape")).lower()
-            if k != "mirror":
+            if k in ("mirror", "reflect", "reflection", "flip"):
+                mirrored.extend(made)
+            else:
+                new.extend(made)
                 kinds[k] = kinds.get(k, 0) + 1
         else:
             bad += 1
@@ -322,4 +527,6 @@ def build_strokes(ai: dict, user_strokes: list[Stroke], log=None) -> list[Stroke
     new = [s for s in new if len(s) >= 2 and not _near_existing(s, user_points)]
     if log is not None and before - len(new):
         log.append(f"Removed {before - len(new)} line(s) that would trace over what you already drew.")
-    return snap_endpoints(new, user_strokes, log=log)
+    # The reflection is a copy placed beside the ink. Don't drop it as a duplicate
+    # and don't snap it back onto the original.
+    return snap_endpoints(new, user_strokes, log=log) + mirrored

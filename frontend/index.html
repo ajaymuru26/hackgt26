@@ -40,6 +40,9 @@
         <input id="imageInput" type="file" accept="image/*" hidden>
         <button id="undoBtn" class="tool" title="Undo (Ctrl+Z)">Undo</button>
         <button id="clearBtn" class="tool" title="Clear the board">Clear</button>
+        <button id="talkBtn" class="tool" aria-pressed="false" title="Talk: ElevenLabs hears you, then the robot draws what you said">
+          Talk
+        </button>
       </div>
 
       <p id="status" class="status" role="status" aria-live="polite"></p>
@@ -62,9 +65,23 @@
 
       </div>
 
+      <div class="model-switch modes" role="group" aria-label="Which AI to ask">
+        <span class="modes-label">Model</span>
+        <button type="button" id="openaiBtn" class="mode is-on" aria-pressed="true">OpenAI</button>
+        <button type="button" id="geminiBtn" class="mode" aria-pressed="false">Gemini</button>
+      </div>
+
+      <label class="writer drawing-note">
+        <span class="writer-label">Fix the drawing</span>
+        <input id="drawingNote" type="text" maxlength="400" placeholder="e.g. add a roof and a door on the house" aria-label="How the robot should change the drawing">
+      </label>
+
       <div class="action-group" role="group" aria-label="What should the robot do">
         <button class="action finish" data-action="answer" title="Solve the maths, answer the question, or continue the pattern">
           <span class="cap cap-blue" aria-hidden="true"></span><span class="action-label">Answer</span>
+        </button>
+        <button class="action" data-action="work" title="Solve it and write the steps on the board, not only the final result">
+          <span class="action-label">Answer but show work</span>
         </button>
         <button class="action" data-action="hint" title="A nudge toward the next step, without the answer">
           <span class="action-label">Hint</span>
@@ -75,8 +92,11 @@
         <button class="action" data-action="drawing" title="Finish the picture on the board">
           <span class="action-label">Finish drawing</span>
         </button>
-        <label class="review-toggle" title="The AI looks at its own drawing once and fixes mistakes (a few seconds slower)">
-          <input id="reviewToggle" type="checkbox" checked> Double-check drawings
+        <button class="action" data-action="cv" title="Finish an unfinished drawing with OpenCV: complete a partial circle, close a gap, or add a missing side. No AI call.">
+          <span class="action-label">CV finish</span>
+        </button>
+        <label class="review-toggle" title="After the first version, the same five-item checklist runs at least twice. Each pass is listed in the thought process.">
+          <input id="reviewToggle" type="checkbox" checked> Recheck at least twice
         </label>
       </div>
 
@@ -103,6 +123,12 @@
         <button id="robotPen" class="tool" disabled title="Test the pen servo">Pen down</button>
         <progress id="robotProgress" max="1" value="0" hidden></progress>
         <span id="robotStatus" class="robot-status" role="status" aria-live="polite">Not connected</span>
+      </div>
+
+      <div class="saved">
+        <p class="saved-label">Saved boards</p>
+        <p id="savedEmpty" class="saved-empty">Finished boards are kept in MongoDB Atlas.</p>
+        <ol id="savedList" class="saved-list"></ol>
       </div>
     </div>
     </div>
