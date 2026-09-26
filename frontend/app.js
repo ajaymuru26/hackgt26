@@ -739,5 +739,99 @@ $("gcodeBtn").onclick = async () => {
   }
 };
 
+// ---------- the real robot ----------
+let plotter = { connected: false, state: "disconnected" };  // the real robot (`robot` is the on-screen one)
+let robotPoll = null;
+let penDown = false;
+
+async function robotApi(path, body) {
+  const res = await fetch("/api/robot/" + path, body === undefined ? {} : {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+  return data;
+}
+
+async function loadRobotPorts() {
+  try {
+    const { ports } = await robotApi("ports");
+    const select = $("robotPort");
+    const keep = select.value;
+    select.innerHTML = "";
+    for (const p of ports) {
+      const opt = document.createElement("option");
+      opt.value = p.device;
+      opt.textContent = p.device === "sim" ? "Simulator" : `${p.device} (${p.description})`;
+      select.appendChild(opt);
+    }
+    // Prefer a real port when one is plugged in
+    const real = ports.find((p) => p.device !== "sim");
+    select.value = ports.some((p) => p.device === keep) ? keep : real ? real.device : "sim";
+  } catch (err) {
+    setRobotStatus("Couldn't list ports: " + err.message, true);
+  }
+}
+
+function setRobotStatus(text, error = false) {
+  const el = $("robotStatus");
+  el.textContent = text;
+  el.className = "robot-status" + (error ? " is-error" : "");
+}
+
+function showRobot(s) {
+  plotter = s;
+  const drawing = s.state === "drawing" || s.state === "paused";
+  $("robotConnect").textContent = s.connected ? "Disconnect" : "Connect";
+  $("robotPort").disabled = s.connected;
+  $("robotSend").disabled = !s.connected || drawing || !lastRobotStrokes.length;
+  $("robotPause").disabled = !drawing;
+  $("robotPause").textContent = s.state === "paused" ? "Resume" : "Pause";
+  $("robotStop").disabled = !drawing;
+  $("robotPen").disabled = !s.connected || drawing;
+  $("robotPen").textContent = penDown ? "Pen up" : "Pen down";
+  const bar = $("robotProgress");
+  bar.hidden = !drawing;
+  if (s.total) { bar.max = s.total; bar.value = s.sent; }
+  let text = s.error || s.message || (s.connected ? "Connected" : "Not connected");
+  if (drawing) text = `${s.state === "paused" ? "Paused" : "Drawing"}: line ${s.sent} of ${s.total}, pen at `
+                    + `${s.pos[0].toFixed(1)}, ${s.pos[1].toFixed(1)} mm` + (s.elapsed ? `, ${Math.round(s.elapsed)} s` : "");
+  setRobotStatus(text, !!s.error);
+  // Poll quickly while drawing, slowly otherwise, not at all when disconnected
+  clearTimeout(robotPoll);
+  if (s.connected) robotPoll = setTimeout(refreshRobot, drawing ? 400 : 2000);
+}
+
+async function refreshRobot() {
+  try { showRobot(await robotApi("status")); }
+  catch (err) { setRobotStatus("Lost contact with the server: " + err.message, true); }
+}
+
+async function robotAction(path, body, busyText) {
+  if (busyText) setRobotStatus(busyText);
+  try { showRobot(await robotApi(path, body)); return true; }
+  catch (err) { setRobotStatus(err.message, true); refreshRobot(); return false; }
+}
+
+$("robotConnect").onclick = () => plotter.connected
+  ? robotAction("disconnect", {})
+  : robotAction("connect", { port: $("robotPort").value }, "Connecting (the Arduino restarts, about 2 s)...");
+$("robotSend").onclick = () => {
+  if (!lastRobotStrokes.length) return;
+  robotAction("draw", { strokes: lastRobotStrokes, width: W, height: H }, "Sending...");
+};
+$("robotPause").onclick = () => robotAction(plotter.state === "paused" ? "resume" : "pause", {});
+$("robotStop").onclick = () => robotAction("stop", {}, "Stopping...");
+$("robotPen").onclick = async () => {
+  if (await robotAction("pen", { down: !penDown })) penDown = !penDown;
+  showRobot(plotter);
+};
+// "Send to robot" depends on there being robot lines, which change after every answer
+new MutationObserver(() => showRobot(plotter)).observe($("gcodeBtn"), { attributes: true, attributeFilter: ["disabled"] });
+
+loadRobotPorts().then(refreshRobot);
+
 window.addEventListener("resize", resize);
 resize();

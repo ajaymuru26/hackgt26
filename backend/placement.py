@@ -1,4 +1,4 @@
-﻿"""
+"""
 Keep the robot's writing off the ink that's already on the board.
 
 The board is tracked as a coarse grid of cells. Anything already written (the

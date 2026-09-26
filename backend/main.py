@@ -5,6 +5,7 @@ Run:  uvicorn main:app --reload     (from the backend/ folder)
 Then open http://localhost:8000
 """
 import base64
+import os
 import re
 import math
 import time
@@ -24,6 +25,7 @@ import gcode
 import handwriting
 import math_solver
 import placement
+import robot as robot_link
 import shapes
 import text_writer
 import tracer
@@ -850,6 +852,96 @@ def trace_image(req: TraceRequest):
 def make_gcode(req: GcodeRequest):
     return gcode.strokes_to_gcode(req.strokes, req.width, req.height,
                                   req.board_width_mm, req.board_height_mm)
+
+
+# ---------- the real robot ----------
+
+# The plotter's drawing area. Override in backend/.env once the frame is built.
+BOARD_W_MM = float(os.environ.get("BOARD_WIDTH_MM", 800))
+BOARD_H_MM = float(os.environ.get("BOARD_HEIGHT_MM", 500))
+
+
+class RobotConnectRequest(BaseModel):
+    port: str                  # "COM3", or "sim" for the simulated robot
+
+
+class RobotDrawRequest(BaseModel):
+    strokes: list[Stroke]
+    width: int
+    height: int
+
+
+class RobotCommandRequest(BaseModel):
+    line: str                  # one G-code or GRBL "$" command
+
+
+class RobotPenRequest(BaseModel):
+    down: bool
+
+
+def robot_call(fn, *args):
+    try:
+        fn(*args)
+    except robot_link.RobotError as e:
+        raise HTTPException(409, str(e))
+    return robot_link.robot.status()
+
+
+@app.get("/api/robot/ports")
+def robot_ports():
+    return {"ports": robot_link.list_ports(), "board_mm": [BOARD_W_MM, BOARD_H_MM]}
+
+
+@app.get("/api/robot/status")
+def robot_status():
+    return robot_link.robot.status()
+
+
+@app.post("/api/robot/connect")
+def robot_connect(req: RobotConnectRequest):
+    return robot_call(robot_link.robot.connect, req.port)
+
+
+@app.post("/api/robot/disconnect")
+def robot_disconnect():
+    return robot_call(robot_link.robot.disconnect)
+
+
+@app.post("/api/robot/draw")
+def robot_draw(req: RobotDrawRequest):
+    if not any(len(s) >= 2 for s in req.strokes):
+        raise HTTPException(400, "There's nothing for the robot to draw yet.")
+    code = gcode.strokes_to_gcode(req.strokes, req.width, req.height, BOARD_W_MM, BOARD_H_MM)
+    return robot_call(robot_link.robot.draw, code)
+
+
+@app.post("/api/robot/pause")
+def robot_pause():
+    return robot_call(robot_link.robot.pause)
+
+
+@app.post("/api/robot/resume")
+def robot_resume():
+    return robot_call(robot_link.robot.resume)
+
+
+@app.post("/api/robot/stop")
+def robot_stop():
+    return robot_call(robot_link.robot.stop, gcode.PEN_UP)
+
+
+@app.post("/api/robot/pen")
+def robot_pen(req: RobotPenRequest):
+    return robot_call(robot_link.robot.command, gcode.PEN_DOWN if req.down else gcode.PEN_UP)
+
+
+@app.post("/api/robot/command")
+def robot_command(req: RobotCommandRequest):
+    try:
+        reply = robot_link.robot.command(req.line)
+    except robot_link.RobotError as e:
+        raise HTTPException(409, str(e))
+    return {**robot_link.robot.status(), "reply": reply}
 
 
 # Serve the frontend from the same server (must come after the API routes)

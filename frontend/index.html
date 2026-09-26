@@ -92,6 +92,18 @@
         <button id="replayBtn" class="tool" disabled title="Watch the robot draw again">Replay</button>
         <button id="gcodeBtn" class="tool" disabled title="Download the robot's lines as G-code">Download G-code</button>
       </div>
+
+      <div class="robot-bar" role="group" aria-label="Real robot">
+        <span class="writer-label">Robot:</span>
+        <select id="robotPort" aria-label="Robot port"></select>
+        <button id="robotConnect" class="tool" title="Connect to the plotter's Arduino (close the Arduino Serial Monitor first)">Connect</button>
+        <button id="robotSend" class="tool robot-send" disabled title="Draw the robot's latest lines on the real board">Send to robot</button>
+        <button id="robotPause" class="tool" disabled>Pause</button>
+        <button id="robotStop" class="tool robot-stop" disabled title="Stop immediately and lift the pen">Stop</button>
+        <button id="robotPen" class="tool" disabled title="Test the pen servo">Pen down</button>
+        <progress id="robotProgress" max="1" value="0" hidden></progress>
+        <span id="robotStatus" class="robot-status" role="status" aria-live="polite">Not connected</span>
+      </div>
     </div>
     </div>
 

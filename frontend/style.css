@@ -341,6 +341,31 @@ button:focus-visible {
 .problem-type[data-type="Hint"] { background: #fdf3d8; color: #6b4608; }
 .problem-type[data-type="Check"] { background: #e1f3ec; color: #0c5a44; }
 
+.robot-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex-basis: 100%;
+}
+
+.robot-send:not(:disabled) {
+  border-color: var(--marker-blue);
+  color: var(--marker-blue);
+  font-weight: 700;
+}
+
+.robot-stop:not(:disabled) {
+  border-color: var(--marker-red);
+  color: var(--marker-red);
+  font-weight: 700;
+}
+
+.robot-bar progress { width: 120px; accent-color: var(--marker-blue); }
+
+.robot-status { color: var(--marker-black); font-size: 0.95em; }
+.robot-status.is-error { color: var(--marker-red); }
+
 .speed {
   display: inline-flex;
   align-items: center;
