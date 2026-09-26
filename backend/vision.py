@@ -194,6 +194,60 @@ def _ask_claude(images: list[tuple[str, str]], user_text: str, system: str = Non
     return "".join(block.text for block in response.content if block.type == "text")
 
 
+def ink_bbox(png_bytes: bytes, region=None):
+    """Tight box around the writing in a picture, in board pixels.
+
+    Vision models often return a box around the whole photo. The answer has to
+    sit just after the actual problem, so this finds the ink itself.
+    """
+    img = Image.open(io.BytesIO(png_bytes)).convert("L")
+    w, h = img.size
+    if region and len(region) >= 4:
+        x1 = max(0, int(float(region[0])))
+        y1 = max(0, int(float(region[1])))
+        x2 = min(w, int(float(region[2])))
+        y2 = min(h, int(float(region[3])))
+    else:
+        x1, y1, x2, y2 = 0, 0, w, h
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return None
+    crop = img.crop((x1, y1, x2, y2))
+    cw, ch = crop.size
+    step_x = max(1, cw // 40)
+    step_y = max(1, ch // 40)
+    samples = [crop.getpixel((x, 0)) for x in range(0, cw, step_x)]
+    samples += [crop.getpixel((x, ch - 1)) for x in range(0, cw, step_x)]
+    samples += [crop.getpixel((0, y)) for y in range(0, ch, step_y)]
+    samples += [crop.getpixel((cw - 1, y)) for y in range(0, ch, step_y)]
+    samples.sort()
+    bg = samples[len(samples) // 2]
+    mask = crop.point([255 if abs(i - bg) > 36 else 0 for i in range(256)])
+    raw = bytearray(mask.tobytes())
+    for y in range(ch):
+        if sum(1 for v in raw[y * cw:(y + 1) * cw] if v) > 0.82 * cw:
+            raw[y * cw:(y + 1) * cw] = b"\x00" * cw
+    for x in range(cw):
+        if sum(1 for y in range(ch) if raw[y * cw + x]) > 0.82 * ch:
+            for y in range(ch):
+                raw[y * cw + x] = 0
+    rows = [sum(raw[y * cw:(y + 1) * cw]) for y in range(ch)]
+    bands, start = [], None
+    for y, ink in enumerate(rows + [0]):
+        if ink and start is None:
+            start = y
+        elif not ink and start is not None:
+            if y - start >= 8:
+                bands.append((start, y, sum(rows[start:y])))
+            start = None
+    if not bands:
+        return None
+    y0, y1b, _ = max(bands, key=lambda b: b[2])
+    xs = [x for y in range(y0, y1b) for x in range(cw) if raw[y * cw + x]]
+    if not xs:
+        return None
+    return (float(x1 + min(xs)), float(y1 + y0), float(x1 + max(xs) + 1), float(y1 + y1b))
+
+
 def close_up(png_bytes: bytes, strokes, pad=40, target=1100) -> bytes | None:
     """Crop to just the ink (no grid, no labels) and enlarge it, so digits are big and clean."""
     pts = [p for s in (strokes or []) for p in s]
@@ -250,10 +304,12 @@ This works for maths, questions, patterns and drawings (e.g. "What do houses hav
 }
 
 
-IMAGE_TEXT = ("The board also has an UPLOADED PICTURE (a worksheet, screenshot or photo) inside the box "
-              "x {0:.0f}-{2:.0f}, y {1:.0f}-{3:.0f}. Treat what is in the picture exactly like writing on the board: "
-              "solve, answer, hint or check the problems shown in it. Give every bbox in board pixels, around "
-              "where that problem appears inside the picture. If the picture has several problems, list each one.")
+IMAGE_TEXT = ("The whiteboard IS an uploaded picture filling x {0:.0f}-{2:.0f}, y {1:.0f}-{3:.0f}. "
+              "There is no blank margin around it. Treat what is in the picture exactly like writing on the board: "
+              "solve, answer, hint or check the problems shown in it. Give every bbox in board pixels, tight around "
+              "that one problem where it appears in the picture. Answers are written ON TOP of the picture, beside "
+              "each problem, so do not use the outer edge of the picture as a bbox. "
+              "If the picture has several problems, list each one.")
 
 
 def analyze_board(png_bytes: bytes, stroke_summary: str = "", strokes=None, mode: str = "auto",

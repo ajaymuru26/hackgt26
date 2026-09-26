@@ -25,7 +25,8 @@ let busy = false;
 let lastRobotStrokes = [];
 let robot = null;       // live simulator state while the robot is drawing
 let lastRobotObjs = [];  // stroke objects the robot added last time (for replay)
-let background = null;  // uploaded picture shown faintly under the ink: { img, x, y, w, h }
+let background = null;  // uploaded picture under the sketch and the answer: { img, x, y, w, h }
+let timedFrom = 0;      // start of an image run, so the status can show total time
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -36,24 +37,35 @@ function resize() {
 }
 
 // ---------- drawing ----------
+function traceStroke(c, pts) {
+  c.beginPath();
+  if (pts.length === 1) {
+    c.arc(pts[0][0], pts[0][1], LINE_WIDTH / 2, 0, Math.PI * 2);
+    return "fill";
+  }
+  c.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
+  return "stroke";
+}
+
 function drawStroke(c, s) {
   const pts = s.points;
   if (!pts.length) return;
+  c.lineCap = "round";
+  c.lineJoin = "round";
+  // White edge so the sketch and the answer stay readable on the photo
+  if (background && (s.owner === "robot" || s.owner === "user")) {
+    c.strokeStyle = "#ffffff";
+    c.fillStyle = "#ffffff";
+    c.lineWidth = LINE_WIDTH + 7;
+    if (traceStroke(c, pts) === "fill") c.fill();
+    else c.stroke();
+  }
   c.strokeStyle = COLORS[s.owner];
   c.fillStyle = COLORS[s.owner];
   c.lineWidth = LINE_WIDTH;
-  c.lineCap = "round";
-  c.lineJoin = "round";
-  if (pts.length === 1) {
-    c.beginPath();
-    c.arc(pts[0][0], pts[0][1], LINE_WIDTH / 2, 0, Math.PI * 2);
-    c.fill();
-    return;
-  }
-  c.beginPath();
-  c.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length; i++) c.lineTo(pts[i][0], pts[i][1]);
-  c.stroke();
+  if (traceStroke(c, pts) === "fill") c.fill();
+  else c.stroke();
 }
 
 function render() {
@@ -189,7 +201,10 @@ function snapshot() {
   const c = off.getContext("2d");
   c.fillStyle = "#ffffff";
   c.fillRect(0, 0, W, H);
-  if (background) c.drawImage(background.img, background.x, background.y, background.w, background.h);
+  // Once the picture has been traced, the model sees the sketch on white, same as a drawing.
+  // The photo stays on screen underneath.
+  const sketched = strokes.some((s) => s.owner === "user");
+  if (background && !sketched) c.drawImage(background.img, background.x, background.y, background.w, background.h);
   strokes.forEach((s) => drawStroke(c, { ...s, owner: "user" }));
   return off.toDataURL("image/png");
 }
@@ -251,7 +266,8 @@ async function runAction(action, button) {
   setStatus(`${ACTION_WORDS[action] || "Looking at the board"}…`);
   clearThoughts();
   const live = addThought("Thinking", "Sending the board to the AI… 0.0 s", "live");
-  const t0 = performance.now();
+  const t0 = timedFrom || performance.now();
+  timedFrom = 0;
   const ticker = setInterval(() => {
     live.querySelector(".thought-detail").textContent =
       `Sending the board to the AI… ${((performance.now() - t0) / 1000).toFixed(1)} s`;
@@ -261,8 +277,7 @@ async function runAction(action, button) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ image: snapshot(), width: W, height: H, action, review: $("reviewToggle").checked,
-                             image_box: background ? [background.x, background.y, background.x + background.w,
-                                                      background.y + background.h] : null,
+                             image_box: strokes.some((s) => s.owner === "user") ? null : imageBox(),
                              strokes: strokes.map((s) => s.points) }),
     });
     const data = await res.json().catch(() => ({}));
@@ -279,16 +294,22 @@ async function runAction(action, button) {
       hint: data.answer,
       check: `Checked your work: ${data.answer}`,
     }[data.mode] || `Finishing ${data.description || "the drawing"}`;
-    setStatus(label, "robot");
+    const runtime = ((performance.now() - t0) / 1000).toFixed(1);
+    setStatus(`${label} · ${runtime} s`, "robot");
+    addThought("Runtime", `${runtime} s`);
 
     saveHistory();
     lastRobotStrokes = data.strokes;
     const drawing = addThought("Drawing", "The robot is drawing it on the board now.", "live");
     await animateRobot(data.strokes);
     drawing.classList.remove("is-live");
+    const total = ((performance.now() - t0) / 1000).toFixed(1);
     drawing.querySelector(".thought-title").textContent = "Done";
-    drawing.querySelector(".thought-detail").textContent = "Finished. Press Replay to watch again.";
-    setStatus(data.mode !== "drawing" ? label : `Finished ${data.description || "the drawing"}`, "robot");
+    drawing.querySelector(".thought-detail").textContent = `Finished in ${total} s. Press Replay to watch again.`;
+    const runtimeThought = [...document.querySelectorAll(".thought")].find((el) => el.querySelector(".thought-title")?.textContent === "Runtime");
+    if (runtimeThought) runtimeThought.querySelector(".thought-detail").textContent = `${total} s`;
+    const finished = data.mode !== "drawing" ? label : `Finished ${data.description || "the drawing"}`;
+    setStatus(`${finished} · ${total} s`, "robot");
   } catch (err) {
     clearInterval(ticker);
     live.remove();
@@ -427,18 +448,59 @@ function loadImage(file) {
   });
 }
 
+// Visible area of the uploaded picture, in board pixels. Cover can extend past the edges.
+function imageBox() {
+  if (!background) return null;
+  return [
+    Math.max(0, background.x),
+    Math.max(0, background.y),
+    Math.min(W, background.x + background.w),
+    Math.min(H, background.y + background.h),
+  ];
+}
+
 async function placeImage(file) {
   if (busy) return;
+  const button = document.querySelector('.action[data-action="answer"]');
+  timedFrom = performance.now();
+  setBusy(true);
+  setStatus("Turning the image into a sketch…");
   try {
     const img = await loadImage(file);
-    // top of the board, leaving room underneath for the robot's answers
-    const maxW = W - 80, maxH = Math.round(H * 0.62);
-    const scale = Math.min(maxW / img.width, maxH / img.height);
-    const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
-    background = { img, x: 40, y: 30, w, h };
+    // Cover the board, then trace the ink into pen strokes — the same input a drawing uses.
+    const scale = Math.max(W / img.width, H / img.height);
+    const w = img.width * scale, h = img.height * scale;
+    const off = document.createElement("canvas");
+    off.width = W;
+    off.height = H;
+    const c = off.getContext("2d");
+    c.fillStyle = "#ffffff";
+    c.fillRect(0, 0, W, H);
+    c.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+    const res = await fetch("/api/trace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image: off.toDataURL("image/png"), x: 0, y: 0, w: W, h: H, detail: "high", width: W, height: H,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
+    // Drop a frame around the whole photo so it isn't treated as part of the problem.
+    const sketched = (data.strokes || []).filter((pts) => {
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      return (Math.max(...xs) - Math.min(...xs)) < W * 0.9 || (Math.max(...ys) - Math.min(...ys)) < H * 0.9;
+    });
+    if (!sketched.length) throw new Error("Couldn't find any writing in that image.");
+    saveHistory();
+    background = { img, x: (W - w) / 2, y: (H - h) / 2, w, h };
+    sketched.forEach((pts) => strokes.push({ owner: "user", points: pts }));
     render();
-    runAction("answer", document.querySelector('.action[data-action="answer"]'));
+    setBusy(false);
+    runAction("answer", button);
   } catch (err) {
+    timedFrom = 0;
+    setBusy(false);
     setStatus(err.message, "error");
   }
 }
@@ -525,12 +587,20 @@ function drawRobot(c) {
   // live segment currently being drawn
   if (robot.penDown && robot.active) {
     const last = robot.active.points[robot.active.points.length - 1];
-    c.strokeStyle = ink;
-    c.lineWidth = LINE_WIDTH;
     c.lineCap = "round";
     c.beginPath();
     c.moveTo(last[0], last[1]);
     c.lineTo(x, y);
+    if (background) {
+      c.strokeStyle = "#ffffff";
+      c.lineWidth = LINE_WIDTH + 7;
+      c.stroke();
+      c.beginPath();
+      c.moveTo(last[0], last[1]);
+      c.lineTo(x, y);
+    }
+    c.strokeStyle = ink;
+    c.lineWidth = LINE_WIDTH;
     c.stroke();
   }
 

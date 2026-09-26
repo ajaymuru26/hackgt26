@@ -120,10 +120,17 @@ def clean_strokes(raw, w, h) -> list[Stroke]:
     return cleaned
 
 
+def _loose_box(box, w, h) -> bool:
+    """A box around the whole board is not a box around the problem."""
+    if not box or len(box) < 4:
+        return True
+    return (float(box[2]) - float(box[0])) >= w * 0.55 or (float(box[3]) - float(box[1])) >= h * 0.55
+
+
 def place_answer(expression, result, bbox, w, h, blank_bbox=None) -> list[Stroke]:
     x1, y1, x2, y2 = bbox
     eq_h = max(y2 - y1, 1)
-    size = min(max(eq_h * 0.85, 28), 160)
+    size = min(max(eq_h * 0.92, 28), 160)
     text = result["answer"]
 
     if result["kind"] == "blank" and blank_bbox:
@@ -134,16 +141,28 @@ def place_answer(expression, result, bbox, w, h, blank_bbox=None) -> list[Stroke
         x = max(10, min(x, w - width - 10))
         return handwriting.text_to_strokes(text, x, max(10, y), size), "inside the blank"
 
-    if result["kind"] == "evaluate" and not expression.strip().endswith("="):
+    if result["kind"] == "evaluate" and not str(expression).strip().endswith("="):
         text = "=" + text  # person wrote "12+7" with no equals sign
 
-    gap = 0.4 * size
-    x, y = x2 + gap, y1 + (eq_h - size) / 2
-    where = "right after the equals sign"
+    gap = 0.28 * size
+    x = x2 + gap
+    y = y1 + (eq_h - size) / 2
+    where = "right after the problem, on the same line"
     if result["kind"] == "solve":
-        x, y, where = x1, y2 + 0.5 * size, "underneath the equation"
-    elif x + handwriting.text_width(text, size) > w - 10:
-        x, y, where = x1, y2 + 0.5 * size, "underneath (no room on the right)"
+        x, y, where = x1, y2 + 0.35 * size, "underneath the equation"
+    else:
+        width = handwriting.text_width(text, size)
+        if x + width > w - 10:
+            avail = (w - 10) - x
+            if avail >= 48:
+                size = max(22, min(size, size * avail / width))
+                y = y1 + (eq_h - size) / 2
+                width = handwriting.text_width(text, size)
+            if x + width > w - 10:
+                # Stay attached to the end of the problem instead of jumping across the board.
+                y = y2 + 0.2 * size
+                x = max(10, x2 - width)
+                where = "just under the end of the problem"
     if all(ch in handwriting.GLYPHS for ch in text):
         x = max(10, min(x, w - handwriting.text_width(text, size) - 10))
         y = max(10, min(y, h - size * 1.2))
@@ -155,12 +174,68 @@ def place_answer(expression, result, bbox, w, h, blank_bbox=None) -> list[Stroke
     return strokes, f"{where}, {cap:.0f} px tall to match your writing"
 
 
+def content_bbox(strokes):
+    pts = [p for s in strokes for p in s]
+    return stroke_bbox(pts) if pts else None
+
+
+def locate_math_box(png, ai_bbox, strokes, w, h, single, pad):
+    """Where the problem actually is, so the answer starts just after it."""
+    if strokes and ai_bbox and not _loose_box(ai_bbox, w, h):
+        refined = refine_bbox(ai_bbox, strokes, pad)
+        if refined is not ai_bbox:
+            return refined
+    if strokes and single:
+        drawn = content_bbox(strokes)
+        if drawn:
+            return drawn
+    # One problem in a picture and nothing drawn on top: the ink on the picture is the problem.
+    if not strokes and single:
+        ink = vision.ink_bbox(png, None)
+        if ink:
+            return ink
+    region = None
+    if ai_bbox and not _loose_box(ai_bbox, w, h):
+        x1, y1, x2, y2 = (float(v) for v in ai_bbox[:4])
+        region = (x1 - pad, y1 - pad, x2 + pad, y2 + pad)
+    ink = vision.ink_bbox(png, region)
+    if single and ink is None:
+        ink = vision.ink_bbox(png, None)
+    if ink:
+        return ink
+    if strokes:
+        drawn = content_bbox(strokes)
+        if drawn:
+            return drawn
+    if ai_bbox and len(ai_bbox) >= 4:
+        return tuple(float(v) for v in ai_bbox[:4])
+    return (40.0, 40.0, 200.0, 100.0)
+
+
+def image_covers_board(box, w, h) -> bool:
+    """True when an uploaded picture already fills the whiteboard, so answers go on top of it."""
+    if not box or len(box) < 4:
+        return False
+    x1, y1, x2, y2 = box
+    return (x2 - x1) >= w * 0.9 and (y2 - y1) >= h * 0.9
+
+
 def write_below(text, user_strokes, w, h, style="print", max_size=60):
-    """Write text under the person's writing, shrinking it until every line fits."""
-    box = stroke_bbox([p for s in user_strokes for p in s])
+    """Write text under the person's writing, shrinking it until every line fits.
+    When the picture already fills the board, write across the picture instead."""
+    box = content_bbox(user_strokes)
     rows = stroke_rows(user_strokes)
-    line_h = min((r[3] - r[1]) for r in rows) if rows else 50
+    line_h = min((r[3] - r[1]) for r in rows) if rows else 48
     size = min(max(line_h * 0.8, 28), max_size)
+    if box is None:
+        x = 36
+        while True:
+            y = max(10, h * 0.62)
+            strokes, written, dropped = text_writer.text_strokes(
+                text, x, y, size, max(w - x - 20, size * 3), style, h - 10)
+            if not dropped or size <= 22:
+                return strokes, size, written, dropped
+            size *= 0.85
     x = max(10, box[0])
     while True:
         y = min(box[3] + size * 0.6, h - size * 1.4)
@@ -208,7 +283,7 @@ def find_blank(expression, bbox, user_strokes):
 
 def collect_problems(ai, user_strokes):
     """One entry per separate problem, even if the AI squashed several into one string."""
-    everything = stroke_bbox([p for s in user_strokes for p in s])
+    everything = content_bbox(user_strokes) or (40, 40, 400, 120)
     problems = []
     raw = ai.get("problems") or [{"expression": ai.get("expression", ""),
                                   "bbox": ai.get("bbox"), "blank_bbox": ai.get("blank_bbox")}]
@@ -257,7 +332,9 @@ def complete(req: CompleteRequest):
         raise HTTPException(400, "The board is empty. Draw something or add an image first.")
     # Layout (where answers go) uses the ink AND the uploaded picture, as if the picture were writing
     layout = list(req.strokes)
-    if req.image_box:
+    # A picture that fills the board is the board. Don't treat its outline as writing,
+    # or answers get pushed into a margin that isn't there. They are drawn on the picture.
+    if req.image_box and not image_covers_board(req.image_box, req.width, req.height):
         bx1, by1, bx2, by2 = req.image_box
         layout.append([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]])
 
@@ -349,7 +426,8 @@ def complete(req: CompleteRequest):
                 failed.append(expression)
                 step(f"{label}: couldn't solve", f"Read it as  {expression}  but SymPy couldn't make sense of it ({e}). Skipping it.")
                 continue
-            bbox = refine_bbox(prob["bbox"], req.strokes, pad)
+            bbox = locate_math_box(png, prob.get("bbox"), req.strokes, req.width, req.height,
+                                   len(problems) == 1, pad)
             blank = prob.get("blank_bbox")
             if result["kind"] == "blank" and not blank:
                 blank = find_blank(expression, bbox, req.strokes)
@@ -386,8 +464,8 @@ def complete(req: CompleteRequest):
         try:
             x, y, size = (float(v) for v in ai.get("position", [])[:3])
         except (TypeError, ValueError):
-            box = stroke_bbox([p for s in layout for p in s])
-            x, y, size = box[2] + 20, box[1], box[3] - box[1]
+            box = content_bbox(layout) or (40, 40, 200, 90)
+            x, y, size = box[2] + 20, box[1], max(box[3] - box[1], 28)
         step("Found the rule", ai.get("reasoning"))
         size = min(max(size * 0.85, 28), 160)
         x = max(10, min(x, req.width - text_writer.measure(text, "print", size) - 10))
@@ -423,7 +501,7 @@ def complete(req: CompleteRequest):
         problems = [p for p in (ai.get("problems") or []) if isinstance(p, dict)]
         if not problems:
             raise HTTPException(422, "I couldn't find any problems with answers to check.")
-        everything = stroke_bbox([p for s in layout for p in s])
+        everything = content_bbox(layout) or (40, 40, req.width - 40, 120)
         strokes, right, wrong, empty = [], 0, 0, 0
         pad = 30 if len(problems) == 1 else 12
         for n, prob in enumerate(problems, 1):
@@ -485,7 +563,18 @@ def complete(req: CompleteRequest):
         answer = answer.replace("{calc}", str(ai.get("calc_guess", "")))
         if not answer:
             raise HTTPException(422, "The AI didn't come up with an answer. Try writing the question more clearly.")
-        # write the answer just under the person's writing, sized like it
+        ink = vision.ink_bbox(png, None) if not req.strokes else None
+        if ink and re.fullmatch(r"=?\s*[\d./+\-xXi]+", answer.replace(" ", "")):
+            shown = answer[1:].strip() if answer.startswith("=") else answer
+            strokes, where = place_answer("problem", {"kind": "evaluate", "answer": shown}, ink,
+                                          req.width, req.height)
+            if strokes:
+                step("Wrote the answer", f"\"{answer}\" {where}.")
+                category = {"type": "Question", "detail": question}
+                identify(category, "The answer is written on the same line as the problem in the picture.")
+                step("Planned the robot", robot_summary(strokes, req.width, req.height))
+                return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
+                        "steps": steps, "category": category}
         strokes, size, written, dropped = write_below(answer, layout, req.width, req.height)
         if not strokes:
             raise HTTPException(422, "There's no room under your question. Write it higher up on the board.")
