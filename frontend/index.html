@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=9">
+  <link rel="stylesheet" href="style.css?v=10">
 </head>
 <body>
   <main class="wall">
@@ -91,7 +91,7 @@
         <button class="action" data-action="hint" title="A nudge toward the next step, without the answer">
           <span class="action-label">Hint</span>
         </button>
-        <button class="action" data-action="check" title="Mark your answers right or wrong">
+        <button class="action" data-action="check" title="Mark your answers, and when one is wrong, point out the mistake">
           <span class="action-label">Check my work</span>
         </button>
         <button class="action" data-action="drawing" title="Finish the picture on the board">
@@ -168,11 +168,15 @@
         <p id="problemType" class="problem-type" hidden></p>
       </div>
       <p id="thoughtsEmpty" class="thoughts-empty">Press Finish it and the robot will explain each step it takes here.</p>
+      <section id="transcript" class="transcript" hidden aria-live="polite">
+        <h3>Transcript</h3>
+        <p id="transcriptText"></p>
+      </section>
       <ol id="thoughtList" class="thought-list"></ol>
     </aside>
     </div>
     </div>
   </main>
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=10"></script>
 </body>
 </html>

@@ -300,3 +300,185 @@ def check_work(expression: str = None, equation: str = None, student_answer: str
     if lhs.free_symbols or rhs.free_symbols:  # it's an equation with no answer written
         return {"correct": None, "correct_answer": solve(expression)["answer"]}
     return {"correct": sp.simplify(lhs - rhs) == 0, "correct_answer": format_number(sp.simplify(lhs))}
+
+
+_OP_WORD = {"+": "plus", "-": "minus", "*": "times", "/": "divided by", "^": "to the power of"}
+
+
+def explain_mistake(expression: str = None, equation: str = None, student_answer: str = None,
+                    correct_answer: str = "") -> dict:
+    """Why a wrong answer is wrong. note is written on the board; detail is spoken."""
+    try:
+        found = _explain_mistake(expression, equation, student_answer, correct_answer)
+    except Exception:
+        found = None
+    if found:
+        return found
+    fix = " ".join(str(correct_answer or "different").split())
+    wrote = " ".join(str(student_answer or expression or "that").split())
+    return {
+        "note": f"not quite. Answer: {fix}"[:90],
+        "detail": f"You wrote {wrote}. That does not check out. The right result is {fix}.",
+    }
+
+
+def _explain_mistake(expression, equation, student_answer, correct_answer) -> dict | None:
+    if equation:
+        return _explain_algebra(equation, student_answer or "", correct_answer)
+    expr = _clean(expression or "")
+    if "=" not in expr:
+        return None
+    lhs_text, rhs_text = expr.split("=", 1)
+    if not rhs_text.strip() or _parse(lhs_text).free_symbols or _parse(rhs_text).free_symbols:
+        if _parse(lhs_text).free_symbols or _parse(rhs_text).free_symbols:
+            return _explain_algebra(expr, rhs_text, correct_answer)
+        return None
+    student = sp.simplify(_parse(rhs_text))
+    correct = sp.simplify(_parse(lhs_text))
+    if sp.simplify(student - correct) == 0:
+        return None
+    binary = _binary(lhs_text)
+    if binary:
+        slip = _binary_slip(*binary, student, correct)
+        if slip:
+            return slip
+    order = _order_slip(lhs_text, student, correct)
+    if order:
+        return order
+    return _gap_slip(lhs_text, student, correct, correct_answer)
+
+
+def _binary(lhs_text):
+    text = _clean(lhs_text).replace(" ", "")
+    match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)([+\-*/^])([+-]?\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _as_int(value):
+    number = sp.simplify(value)
+    if number.is_integer:
+        return int(number)
+    return None
+
+
+def _pack(note, detail) -> dict:
+    return {"note": " ".join(note.split())[:90], "detail": " ".join(detail.split())}
+
+
+def _binary_slip(a, op, b, student, correct):
+    left, right = _parse(a), _parse(b)
+    for trial in "+-*/":
+        if trial == op:
+            continue
+        try:
+            got = sp.simplify(_parse(f"({a}){trial}({b})"))
+        except Exception:
+            continue
+        if sp.simplify(got - student) == 0:
+            return _pack(
+                f"used { _OP_WORD[trial] }, not { _OP_WORD[op] }. {a}{op}{b}={format_number(correct)}",
+                f"The operation is wrong. {a} {_OP_WORD[trial]} {b} is {format_number(student)}, "
+                f"which is what you wrote, but the problem asks for {a} {_OP_WORD[op]} {b}. "
+                f"That is {format_number(correct)}.",
+            )
+    if op == "-" and sp.simplify(_parse(f"({b})-({a})") - student) == 0:
+        return _pack(
+            f"subtraction is backwards. {a}-{b}={format_number(correct)}",
+            f"The subtraction is backwards. {b} minus {a} is {format_number(student)}, "
+            f"but the problem is {a} minus {b}, which is {format_number(correct)}.",
+        )
+    if sp.simplify(student + correct) == 0:
+        return _pack(
+            f"sign is flipped. Answer: {format_number(correct)}",
+            f"The amount is right, but the sign is flipped. "
+            f"You wrote {format_number(student)}. The answer is {format_number(correct)}.",
+        )
+    ai, bi = _as_int(left), _as_int(right)
+    si, ci = _as_int(student), _as_int(correct)
+    if op == "+" and ai is not None and bi is not None and si is not None and ci is not None:
+        ones = (ai % 10) + (bi % 10)
+        if ones >= 10 and si == ones and si != ci:
+            return _pack(
+                f"added only the ones. {a}+{b}={ci}",
+                f"You added the ones digits and stopped. {ai % 10} plus {bi % 10} is {ones}, "
+                f"but the rest of the number still has to be added. {a} plus {b} is {ci}.",
+            )
+        if ones >= 10 and si == ci - 10:
+            return _pack(
+                f"forgot to carry. {a}+{b}={ci}",
+                f"You forgot to carry. {ai % 10} plus {bi % 10} is {ones}, "
+                f"so write {ones % 10} and carry 1. {a} plus {b} is {ci}, not {si}.",
+            )
+    return None
+
+
+def _order_slip(lhs_text, student, correct):
+    text = _clean(lhs_text).replace(" ", "")
+    match = re.fullmatch(r"(\d+)([+\-])(\d+)([*/])(\d+)", text)
+    if not match:
+        return None
+    a, op1, b, op2, c = match.groups()
+    grouped = sp.simplify(_parse(f"(({a}){op1}({b})){op2}({c})"))
+    if sp.simplify(grouped - student) != 0 or sp.simplify(grouped - correct) == 0:
+        return None
+    return _pack(
+        f"do { _OP_WORD[op2] } first. Answer: {format_number(correct)}",
+        f"You did {a} {_OP_WORD[op1]} {b} first, then {_OP_WORD[op2]} {c}, which gives {format_number(student)}. "
+        f"Multiply or divide before you add or subtract. "
+        f"{b} {_OP_WORD[op2]} {c} comes first, so the answer is {format_number(correct)}.",
+    )
+
+
+def _gap_slip(lhs_text, student, correct, correct_answer):
+    diff = sp.simplify(student - correct)
+    gap = _as_int(diff)
+    answer = format_number(correct) if correct_answer in ("", None) else str(correct_answer)
+    problem = _clean(lhs_text)
+    if gap == 1:
+        why = "You are 1 too high."
+    elif gap == -1:
+        why = "You are 1 too low."
+    elif gap in (10, -10):
+        why = "The tens place is off by 1. Check the carry."
+    else:
+        why = f"You are off by {format_number(abs(diff))}."
+    steps = ""
+    try:
+        worked = [ln.strip() for ln in show_work(problem).splitlines() if ln.strip()]
+        if len(worked) > 1:
+            steps = " " + ". ".join(worked[:4]) + "."
+    except Exception:
+        steps = ""
+    return _pack(
+        f"{why} {problem}={answer}",
+        f"{problem.replace('*', ' times ').replace('/', ' divided by ').replace('+', ' plus ').replace('-', ' minus ')} "
+        f"is {answer}, not {format_number(student)}. {why}{steps}",
+    )
+
+
+def _explain_algebra(equation, student_answer, correct_answer):
+    equation = _clean(equation)
+    student = " ".join(str(student_answer or "").split()) or "nothing"
+    answer = " ".join(str(correct_answer or "").split())
+    worked = ""
+    try:
+        lines = [ln.strip() for ln in show_work(equation).splitlines() if ln.strip()]
+        spoken = []
+        for line in lines[:4]:
+            spoken.append(line.replace("*", " times ").replace("^", " to the power "))
+        if spoken:
+            worked = " " + ". ".join(spoken) + "."
+    except Exception:
+        worked = ""
+    copied = re.findall(r"-?\d+(?:\.\d+)?", student)
+    in_problem = set(re.findall(r"\d+(?:\.\d+)?", equation.split("=")[0]))
+    if copied and copied[-1].lstrip("-") in in_problem and answer and copied[-1] not in answer:
+        detail = (f"You wrote {student}, but {copied[-1]} is already in the equation. "
+                  f"It is not the solution.{worked} The answer is {answer}.")
+        note = f"{copied[-1]} is in the problem, not the answer. {answer}"
+    else:
+        detail = f"You wrote {student}.{worked} The answer is {answer}."
+        note = f"not {student}. {answer}"
+    return _pack(note, detail)

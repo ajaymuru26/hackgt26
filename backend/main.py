@@ -26,9 +26,11 @@ import cv_finish
 import gcode
 import handwriting
 import math_solver
+import memory as student_memory
 import placement
 import robot as robot_link
 import shapes
+import speech
 import text_writer
 import tracer
 import vision
@@ -132,8 +134,9 @@ def _from_prompt(ai, prompt, x, y, size, style, width, height, steps, prompt_str
         if not strokes:
             raise HTTPException(422, "The AI couldn't work out how to draw that. Try describing it differently.")
         steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, width, height)})
-        return {"mode": "drawing", "description": ai.get("description", "a drawing"), "answer": "", "strokes": strokes,
-                "prompt_strokes": prompt_strokes, "steps": steps,
+        return {"mode": "drawing", "description": ai.get("description", "a drawing"), "answer": "",
+                "say": explain_drawing(ai.get("description", prompt)),
+                "strokes": strokes, "prompt_strokes": prompt_strokes, "steps": steps,
                 "category": {"type": "Drawing", "detail": ai.get("description", prompt)}}
 
     answer = str(ai.get("answer", "")).strip()
@@ -164,8 +167,10 @@ def _from_prompt(ai, prompt, x, y, size, style, width, height, steps, prompt_str
     steps.append({"title": "Wrote the answer", "detail": f"\"{answer}\" {got.where}, in {written} line(s), "
                                                          "using a single-stroke pen font."})
     steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, width, height)})
-    return {"mode": "answer", "description": prompt, "answer": answer, "strokes": strokes,
-            "prompt_strokes": prompt_strokes, "steps": steps, "category": {"type": "Answer", "detail": prompt}}
+    return {"mode": "answer", "description": prompt, "answer": answer,
+            "say": explain_answer(prompt, answer, ai.get("reasoning")),
+            "strokes": strokes, "prompt_strokes": prompt_strokes, "steps": steps,
+            "category": {"type": "Answer", "detail": prompt}}
 
 
 class GcodeRequest(BaseModel):
@@ -622,13 +627,113 @@ def _reflected(req: CompleteRequest):
     return clean_strokes(raw, req.width, req.height), shapes.highlight_ids(), log
 
 
+def _plain(text) -> str:
+    """Math symbols as words, so the voice reads the working instead of the signs."""
+    t = " ".join(str(text or "").split())
+    for src, dst in (
+        ("**", " to the power of "),
+        ("^", " to the power of "),
+        ("×", " times "),
+        ("÷", " divided by "),
+        ("*", " times "),
+        ("/", " divided by "),
+        ("+", " plus "),
+        ("=", " equals "),
+        ("−", " minus "),
+        ("–", " minus "),
+    ):
+        t = t.replace(src, dst)
+    t = re.sub(r"(?<=\w)\s+x\s+(?=\w)", " times ", t, flags=re.I)
+    t = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " minus ", t)
+    return re.sub(r"\s+", " ", t).strip(" .")
+
+
+def explain_math(expression, answer, work="") -> str:
+    """A short spoken walkthrough: the problem, the steps, then the answer."""
+    problem = _plain(expression)
+    final = _plain(answer)
+    bits = [f"The problem is {problem}."] if problem else []
+    steps = []
+    seen = {problem.lower(), final.lower(), f"{problem} equals {final}".lower()}
+    for line in str(work or "").splitlines():
+        said = _plain(line)
+        if said and said.lower() not in seen:
+            seen.add(said.lower())
+            steps.append(said)
+    if steps:
+        bits.append("Here is how to get there. " + ". ".join(steps) + ".")
+    if final:
+        bits.append(f"The answer is {final}.")
+    return " ".join(bits)
+
+
+def explain_answer(question, answer, reasoning="") -> str:
+    q = " ".join(str(question or "").split())
+    a = " ".join(str(answer or "").split())
+    why = " ".join(str(reasoning or "").split())
+    bits = []
+    if q:
+        bits.append(q if q.endswith((".", "?", "!")) else f"{q}.")
+    if why and why.lower().rstrip(".") not in a.lower():
+        bits.append(why if why.endswith((".", "?", "!")) else f"{why}.")
+    if a:
+        bits.append(f"The answer is {a}.")
+    return " ".join(bits)
+
+
+def explain_drawing(description, plan="") -> str:
+    desc = " ".join(str(description or "this").split()) or "this"
+    idea = " ".join(str(plan or "").split())
+    line = f"I'm drawing {desc}."
+    if idea and idea.lower() not in desc.lower():
+        line += " " + (idea if idea.endswith((".", "?", "!")) else f"{idea}.")
+    return line
+
+
+def _say(result: dict) -> str:
+    """The script ElevenLabs reads while the robot draws."""
+    custom = " ".join(str(result.get("say") or "").split())
+    if custom:
+        return custom[:800]
+    mode = str(result.get("mode") or "")
+    if mode == "drawing":
+        return explain_drawing(result.get("description"), result.get("plan"))[:800]
+    if mode in ("text", "trace", ""):
+        return ""
+    answer = " ".join(str(result.get("answer") or "").split())
+    if not answer:
+        return ""
+    if mode == "math":
+        return explain_math(result.get("expression"), answer)[:800]
+    if mode == "hint" and not answer.lower().startswith("hint"):
+        return f"Hint. {answer}"[:800]
+    if mode == "answer":
+        return explain_answer(result.get("description"), answer)[:800]
+    return answer[:800]
+
+
+def _with_voice(result: dict) -> dict:
+    line = _say(result)
+    if not line:
+        return result
+    result["transcript"] = line
+    audio = speech.synthesize(line)
+    if audio:
+        result["speech"] = "data:audio/mpeg;base64," + base64.b64encode(audio).decode()
+    result.setdefault("steps", []).append({
+        "title": "Explaining the answer",
+        "detail": line,
+    })
+    return result
+
+
 @app.post("/api/complete")
 def complete(req: CompleteRequest):
     started = time.perf_counter()
     result = _complete(req)
     boards.remember(result, source="complete", action=req.action, provider=req.provider,
                     user_strokes=req.strokes, seconds=time.perf_counter() - started)
-    return result
+    return _with_voice(result)
 
 
 def _complete(req: CompleteRequest):
@@ -707,18 +812,20 @@ def _complete(req: CompleteRequest):
                 "strokes": strokes, "highlight": highlight, "steps": steps, "category": category}
 
     fast = req.action in ("answer", "work", "hint", "check")
+    remembered = student_memory.hint_note() if req.action == "hint" else ""
     if fast:
         step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)}. "
                                     "The model only reads the handwriting. Math is solved on this computer.")
     else:
         step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
                                     f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
+    looked = steps[-1]
     if req.action == "drawing" and note:
         step("Your instruction", f"\"{note}\"")
     started = time.perf_counter()
     try:
         if fast:
-            ai = vision.read_fast(png, req.strokes, req.action, req.image_box, req.provider)
+            ai = vision.read_fast(png, req.strokes, req.action, req.image_box, req.provider, remembered)
         else:
             ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
                                       req.image_box, req.provider, note if req.action == "drawing" else "")
@@ -726,7 +833,9 @@ def _complete(req: CompleteRequest):
         raise HTTPException(500, str(e))
     except Exception as e:
         raise HTTPException(502, f"AI request failed: {e}")
-    steps[-1]["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
+    looked["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
+    if remembered:
+        step("Remembered this student", remembered)
 
     mode = picked_mode(ai, req.action)
     description = ai.get("description", "")
@@ -788,7 +897,7 @@ def _complete(req: CompleteRequest):
     if mode == "math":
         step("AI's notes", ai.get("reasoning"))
         problems = collect_problems(ai, layout)
-        strokes, answers, expressions, failed, types = [], [], [], [], []
+        strokes, answers, expressions, failed, types, scripts = [], [], [], [], [], []
         rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12  # tighter when problems sit close together
         for n, prob in enumerate(problems, 1):
@@ -836,6 +945,12 @@ def _complete(req: CompleteRequest):
             types.append(math_category(expression, result["kind"]))
             answers.append(result["answer"])
             expressions.append(expression)
+            spoken_work = ""
+            try:
+                spoken_work = math_solver.show_work(expression)
+            except Exception:
+                spoken_work = ""
+            scripts.append(explain_math(expression, result["answer"], spoken_work))
             step(f"{label}", detail)
         if not strokes:
             raise HTTPException(422, f"Read the math as {', '.join(failed) or 'nothing'} but the AI didn't give a solution. "
@@ -851,7 +966,8 @@ def _complete(req: CompleteRequest):
                  + "; ".join(f"{e} → {a}" for e, a in zip(expressions, answers)) + ".")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
         return {"mode": "math", "description": description, "expression": ";  ".join(expressions),
-                "answer": ", ".join(answers), "strokes": strokes, "steps": steps, "category": category}
+                "answer": ", ".join(answers), "say": " ".join(scripts),
+                "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "fill":
         text = str(ai.get("text", "")).strip()
@@ -885,8 +1001,10 @@ def _complete(req: CompleteRequest):
         category = {"type": "Number pattern" if numeric else "Pattern", "detail": description or "a sequence to continue"}
         identify(category, "It's a sequence, so the next items follow a rule instead of an equation.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "fill", "description": description, "answer": text, "strokes": strokes,
-                "steps": steps, "category": category}
+        why = " ".join(str(ai.get("reasoning") or "").split())
+        said = f"{why.rstrip('.')}. So the next part is {_plain(text)}." if why else f"The sequence continues with {_plain(text)}."
+        return {"mode": "fill", "description": description, "answer": text, "say": said,
+                "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "hint":
         hint = str(ai.get("hint") or ai.get("answer") or "").strip()
@@ -901,8 +1019,10 @@ def _complete(req: CompleteRequest):
         category = {"type": "Hint", "detail": description or "a nudge toward the next step"}
         identify(category, "You asked for a hint, so it points you to the next step instead of solving it.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "hint", "description": description, "answer": text, "strokes": strokes,
-                "steps": steps, "category": category}
+        why = " ".join(str(ai.get("reasoning") or "").split())
+        said = f"Hint. {why.rstrip('.')}. {hint}." if why else f"Hint. {hint}."
+        return {"mode": "hint", "description": description, "answer": text, "say": said,
+                "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "check":
         step("AI's notes", ai.get("reasoning"))
@@ -911,6 +1031,7 @@ def _complete(req: CompleteRequest):
             raise HTTPException(422, "I couldn't find any problems with answers to check.")
         everything = content_bbox(layout) or (40, 40, req.width - 40, 120)
         strokes, right, wrong, empty = [], 0, 0, 0
+        said, notes = [], []
         rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12
         for n, prob in enumerate(problems, 1):
@@ -958,18 +1079,34 @@ def _complete(req: CompleteRequest):
             strokes += got.strokes
             if correct:
                 right += 1
-                step(label, f"Read  {shown}  and the AI checked it: correct. Marked it with a check {got.where}.")
+                said.append(f"{shown} is correct.")
+                step(label, f"Read  {shown}  and checked it here: correct. Marked it with a check {got.where}.")
             else:
                 wrong += 1
-                step(label, f"Read  {shown}  and the AI checked it: not quite. The right answer is {fix or 'different'}, "
-                            f"so it gets an X{' with the correct answer' if has_fix else ''}, {got.where}.")
+                bug = math_solver.explain_mistake(
+                    expression=str(prob.get("expression") or "").strip() or None,
+                    equation=str(prob.get("equation") or "").strip() or None,
+                    student_answer=str(prob.get("student_answer") or "").strip() or None,
+                    correct_answer=fix,
+                )
+                notes.append(bug["note"])
+                fact = f"The student wrote {shown} and it was wrong. {bug['detail']}"
+                if student_memory.remember(fact):
+                    step("Remembered the mistake", "Stored it in Backboard so the next hint can bring it up.")
+                step(label, f"{bug['detail']} Marked it with an X{' and the correct answer' if has_fix else ''}, {got.where}.")
+                said.append(bug["detail"])
         total = right + wrong
         if not total:
             raise HTTPException(422, "I didn't find any finished answers to check. Write your answer after the = sign.")
+        if notes:
+            extra, _, _, where = write_below("\n".join(notes), layout, req.width, req.height, board)
+            strokes += extra
+            step("Pointed out the error", f"Wrote the mistake {where}:\n" + "\n".join(notes))
         category = {"type": "Check", "detail": f"{right} of {total} correct" + (f", {empty} not answered yet" if empty else "")}
-        identify(category, "You asked to check your work, so the AI marked each answer.")
+        identify(category, "You asked to check your work, so each wrong answer gets the mistake and how to fix it.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "check", "description": description, "answer": category["detail"], "strokes": strokes,
+        return {"mode": "check", "description": description, "answer": category["detail"],
+                "say": " ".join(said)[:800], "strokes": strokes,
                 "steps": steps, "category": category}
 
     if mode == "answer":
@@ -998,8 +1135,9 @@ def _complete(req: CompleteRequest):
                 category = {"type": "Question", "detail": question}
                 identify(category, "The answer is written on the same line as the problem in the picture.")
                 step("Planned the robot", robot_summary(strokes, req.width, req.height))
-                return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
-                        "steps": steps, "category": category}
+                return {"mode": "answer", "description": question, "answer": answer,
+                        "say": explain_answer(question, answer, ai.get("reasoning")),
+                        "strokes": strokes, "steps": steps, "category": category}
         strokes, size, written, where = write_below(answer_text, layout, req.width, req.height, board)
         if not strokes:
             raise HTTPException(422, "There's no room left on the board for the answer.")
@@ -1009,8 +1147,9 @@ def _complete(req: CompleteRequest):
         category = {"type": "Question", "detail": question}
         identify(category, "It's written words asking something, so the robot answers it instead of solving or drawing.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
-                "steps": steps, "category": category}
+        return {"mode": "answer", "description": question, "answer": answer,
+                "say": explain_answer(question, answer_text if req.action == "work" else answer, ai.get("reasoning")),
+                "strokes": strokes, "steps": steps, "category": category}
 
     step("Made a plan", ai.get("plan"))
     log = []
@@ -1083,6 +1222,7 @@ def _complete(req: CompleteRequest):
     identify(category, "It's a picture rather than numbers or symbols, so it gets finished with shapes.")
     step("Planned the robot", robot_summary(strokes, req.width, req.height))
     return {"mode": "drawing", "description": description, "plan": ai.get("plan", ""),
+            "say": explain_drawing(description, ai.get("plan", "")),
             "strokes": strokes, "highlight": highlight, "checks": checks, "steps": steps, "category": category}
 
 
@@ -1124,7 +1264,7 @@ def ask(req: AskRequest):
     result = _ask(req)
     boards.remember(result, source="ask", provider=req.provider, user_strokes=req.strokes,
                     heard=req.prompt, seconds=time.perf_counter() - started)
-    return result
+    return _with_voice(result)
 
 
 def _ask(req: AskRequest):
@@ -1185,7 +1325,7 @@ def speak(req: SpeakRequest):
     result = _speak(req)
     boards.remember(result, source="speak", provider=req.provider, user_strokes=req.strokes,
                     seconds=time.perf_counter() - started)
-    return result
+    return _with_voice(result)
 
 
 def _speak(req: SpeakRequest):
@@ -1256,6 +1396,10 @@ def _speak(req: SpeakRequest):
         result["strokes"] = problem_strokes + result["strokes"]
         if solved_value and result.get("answer"):
             result["answer"] = f"{expr} = {solved_value}"
+            try:
+                result["say"] = explain_math(expr, solved_value, math_solver.show_work(expr))
+            except Exception:
+                result["say"] = explain_math(expr, solved_value)
     result["_heard"] = heard
     return result
 
@@ -1413,6 +1557,17 @@ def robot_command(req: RobotCommandRequest):
     except robot_link.RobotError as e:
         raise HTTPException(409, str(e))
     return {**robot_link.robot.status(), "reply": reply}
+
+
+@app.get("/api/host")
+def host_info():
+    """Where this copy is meant to be opened, once it is on Vultr behind a .tech name."""
+    return {
+        "public_url": os.environ.get("PUBLIC_URL", "").strip(),
+        "vultr": bool(os.environ.get("VULTR_API_KEY", "").strip()),
+        "backboard": student_memory.configured(),
+        "voice": speech.configured(),
+    }
 
 
 # Serve the frontend from the same server (must come after the API routes)

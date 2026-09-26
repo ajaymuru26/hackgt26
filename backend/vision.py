@@ -527,7 +527,7 @@ def read_fast(png_bytes: bytes, strokes=None, action: str = "", image_box=None, 
     if image_box:
         user += "\n\n" + PHOTO_READ
     if note and note.strip():
-        user += "\n\n" + note.strip()[:400]
+        user += "\n\n" + note.strip()[:800]
     call = {"max_tokens": 700, "mime": "image/jpeg", "detail": "high"}
     if (provider or "openai").lower() not in ("gemini", "claude"):
         call["model"] = OPENAI_MATH_MODEL

@@ -23,6 +23,7 @@ let current = null;     // stroke being drawn
 let tool = "pen";
 let busy = false;
 let lastRobotStrokes = [];
+let lastSpeech = "";
 let robot = null;       // live simulator state while the robot is drawing
 let lastRobotObjs = [];  // stroke objects the robot added last time (for replay)
 let background = null;  // uploaded picture under the sketch and the answer: { img, x, y, w, h }
@@ -165,6 +166,9 @@ $("clearBtn").onclick = () => {
   strokes = [];
   lastRobotStrokes = [];
   lastRobotObjs = [];
+  lastSpeech = "";
+  showTranscript("");
+  voice.pause();
   background = null;
   $("gcodeBtn").disabled = true;
   $("replayBtn").disabled = true;
@@ -215,6 +219,7 @@ function clearThoughts() {
   $("thoughtList").innerHTML = "";
   $("thoughtsEmpty").hidden = true;
   $("problemType").hidden = true;
+  showTranscript("");
 }
 
 function showProblemType(category) {
@@ -275,6 +280,7 @@ function placeAnswer(newStrokes) {
 async function runAction(action, button, opts = {}) {
   if (busy) return;
   if (!strokes.length && !background) { setStatus("The board is empty. Write, draw, or add an image first.", "error"); return; }
+  armSpeaker();
 
   setBusy(true);
   button.classList.add("is-busy");
@@ -330,6 +336,8 @@ async function runAction(action, button, opts = {}) {
       (data.steps || []).forEach((s) => addThought(s.title, s.detail));
       addThought("Runtime", `${runtime} s until writing`);
       noteSaved(data);
+      showTranscript(data.transcript);
+      playSpeech(data.speech);
       setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
       await animateRobot(data.strokes, { ink: false, record: false });
       return;
@@ -338,6 +346,8 @@ async function runAction(action, button, opts = {}) {
     setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
     addThought("Runtime", `${runtime} s until writing`);
     noteSaved(data);
+    showTranscript(data.transcript);
+    playSpeech(data.speech);
     render();
     lastRobotStrokes = data.strokes;
     const drawing = addThought("Drawing", "The robot is drawing it on the board now.", "live");
@@ -428,6 +438,7 @@ function closeTextBox(submit) {
 
 async function writeAt([x, y], job) {
   if (busy) return;
+  armSpeaker();
   setBusy(true);
   clearThoughts();
   const asking = job.askMode === "answer";
@@ -462,6 +473,8 @@ async function writeAt([x, y], job) {
     lastRobotStrokes = data.strokes;
     setStatus(data.mode === "drawing" ? `Drawing ${data.description}` : data.answer ? `Writing: ${data.answer}` : "Writing", "robot");
     noteSaved(data);
+    showTranscript(data.transcript);
+    playSpeech(data.speech);
     const drawing = addThought(data.mode === "drawing" ? "Drawing" : "Writing", "The robot is on the board now.", "live");
     await animateRobot(data.strokes);
     drawing.classList.remove("is-live");
@@ -563,6 +576,8 @@ async function cropShown() {
     strokes = [];
     lastRobotStrokes = [];
     lastRobotObjs = [];
+    lastSpeech = "";
+    showTranscript("");
     background = { img, x: 0, y: 0, w: W, h: H, source: background.source };
     render();
     setStatus("Showing only the whiteboard. Press Answer when you want it solved.", "robot");
@@ -586,6 +601,8 @@ async function placeImage(file) {
     strokes = [];
     lastRobotStrokes = [];
     lastRobotObjs = [];
+    lastSpeech = "";
+    showTranscript("");
     background = { img, x: 0, y: 0, w: W, h: H, source };
     timedFrom = 0;
     render();
@@ -753,6 +770,8 @@ async function finishTalk(blob, mime) {
     await showThoughts(data.steps);
     lastRobotStrokes = data.strokes;
     noteSaved(data);
+    showTranscript(data.transcript);
+    playSpeech(data.speech);
     const drawing = addThought("Drawing", "The robot is drawing what you said.", "live");
     await animateRobot(data.strokes);
     drawing.classList.remove("is-live");
@@ -772,6 +791,7 @@ async function finishTalk(blob, mime) {
 $("talkBtn").onclick = async () => {
   if (busy) return;
   if (recorder && recorder.state === "recording") {
+    armSpeaker();
     recorder.stop();
     return;
   }
@@ -1157,6 +1177,8 @@ async function replay() {
   strokes = strokes.filter((s) => !lastRobotObjs.includes(s));
   setBusy(true);
   setStatus("Replaying the robot…", "robot");
+  showTranscript(lastTranscript);
+  playSpeech(lastSpeech);
   await animateRobot(lastRobotStrokes);
   setStatus("Replay finished", "robot");
   setBusy(false);
@@ -1278,6 +1300,69 @@ new MutationObserver(() => showRobot(plotter)).observe($("gcodeBtn"), { attribut
 
 loadRobotPorts().then(refreshRobot);
 
+const SILENCE = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+const voice = new Audio(SILENCE);
+let lastTranscript = "";
+
+function armSpeaker() {
+  voice.src = SILENCE;
+  const play = voice.play();
+  if (play) play.then(() => voice.pause()).catch(() => {});
+}
+
+function showTranscript(text) {
+  const box = $("transcript");
+  const body = $("transcriptText");
+  lastTranscript = text || "";
+  if (!text) {
+    box.hidden = true;
+    body.replaceChildren();
+    return;
+  }
+  body.replaceChildren();
+  text.split(/(\s+)/).forEach((part) => {
+    if (!part.trim()) {
+      body.append(part);
+      return;
+    }
+    const word = document.createElement("span");
+    word.className = "transcript-word";
+    word.textContent = part;
+    body.append(word);
+  });
+  box.hidden = false;
+  box.scrollIntoView({ block: "nearest" });
+}
+
+function markTranscript(fraction) {
+  const words = $("transcriptText").querySelectorAll(".transcript-word");
+  if (!words.length) return;
+  const said = fraction <= 0 ? 0 : fraction >= 1 ? words.length : Math.ceil(fraction * words.length);
+  words.forEach((word, i) => {
+    word.classList.toggle("is-pending", i >= said);
+    word.classList.toggle("is-said", i < said);
+  });
+}
+
+function playSpeech(url) {
+  lastSpeech = url || "";
+  if (!url) {
+    voice.pause();
+    if (lastTranscript) markTranscript(1);
+    return;
+  }
+  voice.src = url;
+  markTranscript(0);
+  const play = voice.play();
+  if (play) play.catch(() => markTranscript(1));
+}
+
+voice.addEventListener("timeupdate", () => {
+  if (!voice.duration) return;
+  markTranscript(voice.currentTime / voice.duration);
+});
+voice.addEventListener("ended", () => markTranscript(1));
+
 function noteSaved(data) {
   if (!data.board_id) return;
   addThought("Saved", "Stored this board in MongoDB Atlas.");
@@ -1393,3 +1478,8 @@ $("machineTest").onclick = async () => {
 window.addEventListener("resize", resize);
 resize();
 loadSaved();
+fetch("/api/host").then((res) => res.json()).then((data) => {
+  if (!data.public_url) return;
+  const hint = document.querySelector(".top .hint");
+  if (hint) hint.append(document.createTextNode("  Live at " + data.public_url));
+}).catch(() => {});

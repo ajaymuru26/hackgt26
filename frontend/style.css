@@ -255,6 +255,25 @@ h1 {
 .thoughts-empty { margin: 0 0 8px; color: #6b7682; }
 .thoughts-empty[hidden] { display: none; }
 
+.transcript {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f4f7f2;
+  border: 1px solid #d5e3cc;
+}
+.transcript[hidden] { display: none; }
+.transcript h3 {
+  margin: 0 0 4px;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #3d6b32;
+}
+.transcript p { margin: 0; color: #243028; overflow-wrap: anywhere; }
+.transcript-word.is-pending { color: #8b97a3; }
+.transcript-word.is-said { color: #173f8f; font-weight: 700; }
+
 .thought-list {
   list-style: none;
   margin: 0;
