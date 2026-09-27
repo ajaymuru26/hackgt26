@@ -6,6 +6,13 @@ Adjust PEN_UP / PEN_DOWN to match your hardware:
   - Z-axis pen lift: "G0 Z5" / "G1 Z0 F500"
 """
 import math
+import os
+
+# The plotter's drawing area in mm. The racks allow about 174 mm (X) and 190 mm (Y) of
+# travel, less the carriage. Measure what the built frame really reaches and set
+# BOARD_WIDTH_MM / BOARD_HEIGHT_MM in backend/.env.
+BOARD_W_MM = float(os.environ.get("BOARD_WIDTH_MM", 160))
+BOARD_H_MM = float(os.environ.get("BOARD_HEIGHT_MM", 170))
 
 PEN_UP = "M3 S90"
 PEN_DOWN = "M3 S30"
@@ -32,13 +39,25 @@ def order_strokes(strokes):
     return ordered
 
 
-def strokes_to_gcode(strokes, canvas_w, canvas_h, board_w_mm, board_h_mm,
+def board_fit(canvas_w, canvas_h, board_w_mm=None, board_h_mm=None):
+    """mm per canvas pixel, and the offset that centres the canvas in the drawing area.
+
+    One scale for both axes, so writing isn't stretched: the on-screen board is wide
+    (1200 x 700) and the plotter's area is nearly square, so the canvas fills the
+    area's width and is centred top to bottom."""
+    board_w_mm = BOARD_W_MM if board_w_mm is None else board_w_mm
+    board_h_mm = BOARD_H_MM if board_h_mm is None else board_h_mm
+    scale = min(board_w_mm / canvas_w, board_h_mm / canvas_h)
+    return scale, (board_w_mm - canvas_w * scale) / 2, (board_h_mm - canvas_h * scale) / 2
+
+
+def strokes_to_gcode(strokes, canvas_w, canvas_h, board_w_mm=None, board_h_mm=None,
                      draw_feed=3000, flip_y=True) -> str:
-    sx, sy = board_w_mm / canvas_w, board_h_mm / canvas_h
+    scale, ox, oy = board_fit(canvas_w, canvas_h, board_w_mm, board_h_mm)
 
     def mm(p):
-        x = p[0] * sx
-        y = (canvas_h - p[1]) * sy if flip_y else p[1] * sy  # machine Y usually points up
+        x = ox + p[0] * scale
+        y = oy + ((canvas_h - p[1]) if flip_y else p[1]) * scale  # machine Y usually points up
         return f"X{x:.2f} Y{y:.2f}"
 
     lines = ["G21 ; millimetres", "G90 ; absolute positioning", PEN_UP, PEN_DELAY]

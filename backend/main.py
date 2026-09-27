@@ -177,8 +177,8 @@ class GcodeRequest(BaseModel):
     strokes: list[Stroke]
     width: int
     height: int
-    board_width_mm: float = 800
-    board_height_mm: float = 500
+    board_width_mm: float = gcode.BOARD_W_MM
+    board_height_mm: float = gcode.BOARD_H_MM
 
 
 # ---------- helpers ----------
@@ -700,7 +700,7 @@ def collect_problems(ai, user_strokes):
 
 def robot_summary(strokes, w, h) -> str:
     """Estimate what the real plotter will do (same maths as gcode.py and the simulator)."""
-    mm = 800 / w  # board is 800 mm wide
+    mm, _, _ = gcode.board_fit(w, h)  # mm per canvas pixel on the real board
     ordered = gcode.order_strokes(strokes)
     ink = sum(math.dist(a, b) for s in ordered for a, b in zip(s, s[1:])) * mm
     travel, pos = 0.0, (0.0, float(h))
@@ -1653,9 +1653,8 @@ def make_gcode(req: GcodeRequest):
 
 # ---------- the real robot ----------
 
-# The plotter's drawing area. Override in backend/.env once the frame is built.
-BOARD_W_MM = float(os.environ.get("BOARD_WIDTH_MM", 800))
-BOARD_H_MM = float(os.environ.get("BOARD_HEIGHT_MM", 500))
+# The plotter's drawing area (set in backend/.env; see gcode.py)
+BOARD_W_MM, BOARD_H_MM = gcode.BOARD_W_MM, gcode.BOARD_H_MM
 
 
 class RobotConnectRequest(BaseModel):

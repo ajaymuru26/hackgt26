@@ -70,8 +70,8 @@ Send these from the Serial Monitor (or the app), one per line. Settings are save
 
 | Setting | Meaning | Default |
 |---|---|---|
-| `$100`, `$101` | steps per mm, X and Y | 10 |
-| `$110`, `$111` | top speed, mm/min | 1500 |
+| `$100`, `$101` | steps per mm, X and Y | 2.768 (measured, see below) |
+| `$110`, `$111` | top speed, mm/min | 3000 |
 | `$120`, `$121` | acceleration, mm/s^2 | 150 |
 | `$140` | motor power, % | 60 |
 | `$150` | 1 = full steps (more torque), 0 = half steps (smoother) | 0 |
@@ -84,9 +84,17 @@ Send these from the Serial Monitor (or the app), one per line. Settings are save
 steps/mm = steps per revolution / (pinion teeth x rack tooth pitch in mm)
 ```
 
-A 200-step NEMA 17 in half steps (`$150=0`) makes 400 steps per revolution. To measure it
-instead: send `G91 G0 X50`, measure how far the rack actually moved (say 42 mm), then set
-`$100 = 10 x 50 / 42`, i.e. current value x commanded / measured.
+A 200-step NEMA 17 in half steps (`$150=0`) makes 400 steps per revolution. Our parts (from
+the STLs): a 92-tooth gear on a module-0.5 rack (1.5708 mm per tooth) moves 92 x 1.5708 =
+144.5 mm per turn, so **400 / 144.5 = 2.768 steps/mm** (1.384 in full steps). That assumes the
+gear sits directly on the motor shaft.
+
+To check it: send `G91 G0 X50`, measure how far the rack actually moved (say 48 mm), then set
+`$100 = 2.768 x 50 / 48`, i.e. current value x commanded / measured.
+
+**Drawing area:** the racks allow about 174 mm (X) and 190 mm (Y) of travel. Measure what the
+built frame reaches and set `BOARD_WIDTH_MM` / `BOARD_HEIGHT_MM` in `backend/.env` (default
+160 x 170). The app keeps drawings in proportion and centres them in that area.
 
 **Zero:** move the pen to the board's bottom-left corner and send `G92 X0 Y0`.
 

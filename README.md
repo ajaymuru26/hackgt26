@@ -97,8 +97,8 @@ The **Robot** bar under the board streams the robot's latest lines straight to t
 Set the plotter's drawing area in `backend/.env` once the frame is built:
 
 ```dotenv
-BOARD_WIDTH_MM=800
-BOARD_HEIGHT_MM=500
+BOARD_WIDTH_MM=160
+BOARD_HEIGHT_MM=170
 ```
 
 `backend/robot.py` does the streaming: it sends one line at a time and waits for GRBL's

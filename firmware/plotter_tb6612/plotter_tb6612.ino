@@ -45,13 +45,14 @@ struct Settings {
   uint8_t power;        // $140 motor power %, as PWM duty (the TB6612 has no current limit)
   uint8_t fullStep;     // $150 1 = full steps, 0 = half steps
 };
-const uint8_t SETTINGS_VERSION = 1;
+const uint8_t SETTINGS_VERSION = 2;  // bump when defaults change, so the Nano picks them up
 Settings cfg;
 
 void defaults() {
   cfg.version = SETTINGS_VERSION;
-  cfg.stepsPerMm[0] = cfg.stepsPerMm[1] = 10.0;  // calibrate: see README
-  cfg.maxRate[0] = cfg.maxRate[1] = 1500.0;
+  // 400 half steps per turn / (92-tooth gear x 1.5708 mm module-0.5 rack pitch = 144.5 mm per turn)
+  cfg.stepsPerMm[0] = cfg.stepsPerMm[1] = 2.768;
+  cfg.maxRate[0] = cfg.maxRate[1] = 3000.0;
   cfg.accel[0] = cfg.accel[1] = 150.0;
   cfg.idleMs = 250;
   cfg.invert = 0;
