@@ -742,7 +742,7 @@ Judge it against the plan. A copy of the whole drawing is only ok when the plan 
 
 
 def review_drawing(png_bytes: bytes, user_strokes, new_strokes, stroke_summary: str, previous: dict,
-                   provider: str = "openai", check: int = 1, limit: int = 3) -> dict:
+                   provider: str = "openai", check: int = 1, limit: int = 3, problems: str = "") -> dict:
     """Show the AI its own result so it can accept it or say what to change."""
     img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     d = ImageDraw.Draw(img)
@@ -755,6 +755,8 @@ def review_drawing(png_bytes: bytes, user_strokes, new_strokes, stroke_summary: 
     keep = {k: previous.get(k) for k in ("description", "plan", "shapes") if previous.get(k) is not None}
     text = (REVIEW_TEXT.format(previous=json.dumps(keep)[:6000], check=check, limit=limit)
             + "\n\nThe person's strokes, as exact coordinates with named corners:\n" + stroke_summary)
+    if problems:  # measured in code (shapes.conflict_note), so trust it over the picture
+        text += "\n\n" + problems
     images = [(f"IMAGE 1: the board ({w} x {h} px) with your additions in blue, grid and stroke labels.",
                base64.b64encode(gridded).decode())]
     return _dispatch(images, text, None, provider)

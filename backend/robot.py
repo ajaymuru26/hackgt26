@@ -49,6 +49,8 @@ class SerialLink:
         try:
             self.port = serial.Serial(port, BAUD, timeout=0.1, write_timeout=2)
         except serial.SerialException as e:
+            if "FileNotFound" in str(e) or "cannot find" in str(e):
+                raise RobotError(f"{port} isn't there. Is the Nano plugged in? (Refresh the page to update the port list.)")
             raise RobotError(f"Couldn't open {port}. Is the Arduino Serial Monitor (or another program) "
                              f"using it? ({e})")
         # The status poller and the sender both write. On Windows, two writes at once
@@ -187,6 +189,7 @@ class Robot:
         self.error = ""
         self.started = None
         self.acks = deque()
+        self.said = deque(maxlen=40)  # other lines the controller printed ($$ settings, messages)
         self.ack_ready = threading.Condition()
         self.cmd_lock = threading.Lock()   # one sender at a time
         self.stop_flag = threading.Event()
@@ -252,8 +255,10 @@ class Robot:
                     self.ack_ready.notify_all()
             elif line.startswith("ALARM"):
                 self.error = f"GRBL alarm: {line}"
-            elif line.startswith("["):  # GRBL's messages and settings replies
-                self.message = line.strip("[]")
+            else:
+                if line.startswith("["):  # GRBL's messages
+                    self.message = line.strip("[]")
+                self.said.append(line)  # e.g. "$100=2.768 (x, step/mm)" from $$
 
     def _poller(self):
         link = self.link
@@ -293,10 +298,12 @@ class Robot:
             raise RobotError("Type a G-code command first.")
         with self.cmd_lock:
             self.stop_flag.clear()
+            self.said.clear()
             reply = self._send(line, timeout=30)
+            said = list(self.said)
         if reply.startswith("error"):
             raise RobotError(f"GRBL rejected '{line}': {reply}")
-        return reply
+        return "\n".join(said + [reply])  # "$$" returns every setting, then "ok"
 
     def draw(self, gcode_text):
         self._need_link()

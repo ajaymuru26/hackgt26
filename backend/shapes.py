@@ -487,6 +487,138 @@ def snap_endpoints(new_strokes: list[Stroke], user_strokes: list[Stroke],
     return out
 
 
+# ---------- keeping new lines off the person's ink ----------
+
+_CELL = 24  # spatial-hash cell for looking up nearby ink segments
+
+
+def _ink_index(user_strokes):
+    """The person's line segments, bucketed by grid cell so nearby ones are quick to find."""
+    grid = {}
+    for s in user_strokes:
+        for a, b in zip(s, s[1:]):
+            for cx in range(int(min(a[0], b[0]) // _CELL), int(max(a[0], b[0]) // _CELL) + 1):
+                for cy in range(int(min(a[1], b[1]) // _CELL), int(max(a[1], b[1]) // _CELL) + 1):
+                    grid.setdefault((cx, cy), []).append((a, b))
+    return grid
+
+
+def _nearby(grid, x1, y1, x2, y2, pad=0.0):
+    seen = set()
+    for cx in range(int((min(x1, x2) - pad) // _CELL), int((max(x1, x2) + pad) // _CELL) + 1):
+        for cy in range(int((min(y1, y2) - pad) // _CELL), int((max(y1, y2) + pad) // _CELL) + 1):
+            for seg in grid.get((cx, cy), ()):
+                if id(seg) not in seen:
+                    seen.add(id(seg))
+                    yield seg
+
+
+def _cross(p, q, a, b):
+    """Where segment p-q crosses segment a-b, or None."""
+    d = (q[0] - p[0]) * (b[1] - a[1]) - (q[1] - p[1]) * (b[0] - a[0])
+    if abs(d) < 1e-9:
+        return None
+    t = ((a[0] - p[0]) * (b[1] - a[1]) - (a[1] - p[1]) * (b[0] - a[0])) / d
+    u = ((a[0] - p[0]) * (q[1] - p[1]) - (a[1] - p[1]) * (q[0] - p[0])) / d
+    if 0 <= t <= 1 and 0 <= u <= 1:
+        return [p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1])]
+    return None
+
+
+def _resample(stroke, step=3.0):
+    out = [list(stroke[0])]
+    for a, b in zip(stroke, stroke[1:]):
+        n = max(1, int(math.dist(a, b) / step))
+        out += [[a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n] for i in range(1, n + 1)]
+    return out
+
+
+def _on_ink(grid, p, touch):
+    return any(math.dist(p, _closest_on_segment(p, a, b)) < touch
+               for a, b in _nearby(grid, p[0], p[1], p[0], p[1], touch))
+
+
+def ink_conflicts(new_strokes, user_strokes, touch=6.0, end_ok=18.0, min_run=20.0):
+    """Where new lines cross the person's ink, or run along it, away from their own ends.
+
+    A new line's ends are meant to join the drawing (they're snapped onto it), so contact
+    within `end_ok` px of an end is fine. Returns (crossings, overlaps): lists of
+    (stroke index, [x, y]) and (stroke index, [x, y] midpoint, length in px)."""
+    grid = _ink_index(user_strokes)
+    crossings, overlaps = [], []
+    for i, s in enumerate(new_strokes):
+        if len(s) < 2:
+            continue
+        ends = (s[0], s[-1]) if math.dist(s[0], s[-1]) >= 1 else ()  # closed shapes have no joining ends
+        found = []
+        for p, q in zip(s, s[1:]):
+            for a, b in _nearby(grid, p[0], p[1], q[0], q[1]):
+                c = _cross(p, q, a, b)
+                if c and all(math.dist(c, e) >= end_ok for e in ends) and all(math.dist(c, f) >= 10 for f in found):
+                    found.append(c)
+        crossings += [(i, [round(c[0]), round(c[1])]) for c in found]
+        run = []
+        for p in _resample(s) + [None]:
+            hit = p is not None and all(math.dist(p, e) >= end_ok for e in ends) and _on_ink(grid, p, touch)
+            if hit:
+                run.append(p)
+            elif run:
+                length = sum(math.dist(a, b) for a, b in zip(run, run[1:]))
+                if length >= min_run:
+                    mid = run[len(run) // 2]
+                    overlaps.append((i, [round(mid[0]), round(mid[1])], round(length)))
+                run = []
+    return crossings, overlaps
+
+
+def conflict_note(new_strokes, user_strokes) -> str:
+    """A plain-language note for the AI's check pass, or "" if nothing crosses the ink."""
+    crossings, overlaps = ink_conflicts(new_strokes, user_strokes)
+    if not crossings and not overlaps:
+        return ""
+    lines = ["MEASURED PROBLEMS (exact, from the coordinates): your blue lines touch the person's black ink "
+             "where they should not (not at a line's own ends, where joining is fine):"]
+    if overlaps:
+        lines.append("- Running along / over existing lines (the robot would trace over their ink): "
+                     + "; ".join(f"about {n} px near ({x}, {y})" for _, (x, y), n in overlaps[:8]))
+    if crossings:
+        lines.append("- Cutting across existing lines at: "
+                     + ", ".join(f"({x}, {y})" for _, (x, y) in crossings[:12]))
+    lines.append("If these are mistakes (a shape placed on top of the drawing, a line through it), move or "
+                 "resize those shapes so they sit beside the existing lines and only touch them at their ends. "
+                 "Keep a crossing only if the drawing really needs it (like the points of a star).")
+    return "\n".join(lines)
+
+
+def lift_over_ink(new_strokes, user_strokes, touch=6.0, end_ok=18.0, min_run=20.0, log=None):
+    """Last safety net: lift the pen wherever a new line would run along the person's ink.
+    Single crossings are left alone (some drawings need them); only tracing over ink is cut."""
+    _, overlaps = ink_conflicts(new_strokes, user_strokes, touch, end_ok, min_run)
+    if not overlaps:
+        return new_strokes
+    grid = _ink_index(user_strokes)
+    bad = {i for i, _, _ in overlaps}
+    out, cut = [], 0
+    for i, s in enumerate(new_strokes):
+        if i not in bad:
+            out.append(s)
+            continue
+        ends = (s[0], s[-1]) if math.dist(s[0], s[-1]) >= 1 else ()
+        piece = []
+        for p in _resample(s) + [None]:
+            on = p is not None and all(math.dist(p, e) >= end_ok for e in ends) and _on_ink(grid, p, touch)
+            if p is not None and not on:
+                piece.append(p)
+                continue
+            if len(piece) >= 2 and sum(math.dist(a, b) for a, b in zip(piece, piece[1:])) >= 6:
+                out.append([[round(x, 1), round(y, 1)] for x, y in simplify(piece, 1.0)])
+            piece = []
+        cut += 1
+    if log is not None:
+        log.append(f"Lifted the pen where {cut} new line(s) would have run over what you drew.")
+    return out
+
+
 def build_strokes(ai: dict, user_strokes: list[Stroke], log=None, board=(1200, 700)) -> list[Stroke]:
     """Everything the AI asked for, as strokes, with duplicates removed and ends snapped."""
     new, mirrored, kinds, bad = [], [], {}, 0

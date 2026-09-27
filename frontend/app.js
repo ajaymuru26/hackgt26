@@ -1260,6 +1260,7 @@ function showRobot(s) {
   $("robotPause").textContent = s.state === "paused" ? "Resume" : "Pause";
   $("robotStop").disabled = !drawing;
   $("robotPen").disabled = !s.connected || drawing;
+  $("robotCmd").disabled = $("robotCmdSend").disabled = !s.connected || drawing;
   $("robotPen").textContent = penDown ? "Pen up" : "Pen down";
   const bar = $("robotProgress");
   bar.hidden = !drawing;
@@ -1299,6 +1300,29 @@ $("robotPen").onclick = async () => {
 };
 // "Send to robot" depends on there being robot lines, which change after every answer
 new MutationObserver(() => showRobot(plotter)).observe($("gcodeBtn"), { attributes: true, attributeFilter: ["disabled"] });
+
+// Command box: type G-code for tests and calibration (G91 G0 X10, $$, G92 X0 Y0...)
+function robotLog(text) {
+  const log = $("robotLog");
+  log.hidden = false;
+  log.textContent = (log.textContent + text + "\n").split("\n").slice(-40).join("\n");
+  log.scrollTop = log.scrollHeight;
+}
+
+$("robotCmdForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const line = $("robotCmd").value.trim();
+  if (!line) return;
+  robotLog("> " + line);
+  try {
+    const s = await robotApi("command", { line });
+    robotLog(s.reply || "ok");
+    showRobot(s);
+    $("robotCmd").value = "";
+  } catch (err) {
+    robotLog(err.message);
+  }
+};
 
 loadRobotPorts().then(refreshRobot);
 

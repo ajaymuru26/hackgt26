@@ -1352,9 +1352,10 @@ def _complete(req: CompleteRequest):
         for n in range(1, check_limit + 1):
             checks = n
             started = time.perf_counter()
+            problems = shapes.conflict_note(strokes, req.strokes)
             try:
                 fix = vision.review_drawing(png, req.strokes, strokes, summary, previous, req.provider,
-                                            n, check_limit)
+                                            n, check_limit, problems)
             except Exception as e:
                 step(f"Check {n} of {check_limit}", f"This check failed ({e}). Asking again.")
                 continue
@@ -1395,6 +1396,8 @@ def _complete(req: CompleteRequest):
     elif not strokes and req.strokes and _REFLECT.search(note):
         strokes, highlight, reflect_log = _reflected(req)
         log = reflect_log or log
+    # Safety net after the checks: never trace over the person's lines
+    strokes = shapes.lift_over_ink(strokes, req.strokes, log=log)
     for line in log:
         step("Cleaned up the drawing", line)
     if not strokes:

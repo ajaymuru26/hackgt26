@@ -131,6 +131,23 @@
         <button id="robotPen" class="tool" disabled title="Test the pen servo">Pen down</button>
         <progress id="robotProgress" max="1" value="0" hidden></progress>
         <span id="robotStatus" class="robot-status" role="status" aria-live="polite">Not connected</span>
+        <form id="robotCmdForm" class="robot-cmd">
+          <input id="robotCmd" type="text" list="robotCmdList" autocomplete="off" spellcheck="false" disabled
+                 placeholder="Command, e.g. G91 G0 X10" aria-label="Command for the robot">
+          <datalist id="robotCmdList">
+            <option value="G91 G0 X10">move X +10 mm</option>
+            <option value="G91 G0 X-10">move X -10 mm</option>
+            <option value="G91 G0 Y10">move Y +10 mm</option>
+            <option value="G91 G0 Y-10">move Y -10 mm</option>
+            <option value="G91 G0 X50">move X +50 mm (distance test)</option>
+            <option value="G92 X0 Y0">this spot is zero</option>
+            <option value="M3 S30">pen down</option>
+            <option value="M3 S90">pen up</option>
+            <option value="$$">show settings</option>
+          </datalist>
+          <button id="robotCmdSend" class="tool" type="submit" disabled>Run</button>
+        </form>
+        <pre id="robotLog" class="robot-log" hidden></pre>
       </div>
 
     </div>
