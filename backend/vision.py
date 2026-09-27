@@ -15,6 +15,8 @@ from PIL import Image, ImageDraw
 # The board buttons pick OpenAI or Gemini. Claude is still available if you pass provider "claude".
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
+# Handwriting reads use a smaller model. Drawings still use OPENAI_MODEL.
+OPENAI_MATH_MODEL = os.environ.get("OPENAI_MATH_MODEL", "gpt-4o-mini")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 GRID_STEP = 100
 
@@ -66,8 +68,12 @@ How to pick the mode:
   "blank" (the missing number goes in the blank), or "check" (both sides are already filled in;
   answer is "✓" if they match and "✗" if they do not).
 - If a line ends with "=" and nothing after it, keep the trailing "=".
-- If the person left a blank (an underscore, an empty box, a "?" or a gap) replace it with _ ,
+- If the person left a blank (an underscore, an empty box, or a gap) replace it with _ ,
   e.g. "5+_=9" or "_x4=20", and give its location in "blank_bbox". Otherwise "blank_bbox" is null.
+- A question mark is punctuation, not a blank. It is a curve with its own dot underneath.
+  Keep that dot as part of the ?. Do not drop it and do not read it as a separate period.
+- A period is a dot on the baseline. Keep it. 3.14 is not 314, and "Yes." keeps the period.
+  Words with a ? or a period are a QUESTION, not math and not a drawing.
 - Use * for multiply, / for divide, ^ for powers.
 - Handwritten digits are easily mistaken for letters. Assume a character is a DIGIT unless it is
   clearly an algebra variable in an equation: S/s -> 5, Z/z -> 2, l/I/| -> 1, O/o -> 0, g/q -> 9,
@@ -176,21 +182,26 @@ def _parse_json(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
-def _ask_openai(images: list[tuple[str, str]], user_text: str, system: str = None) -> str:
-    """images = [(caption, base64_png), ...]"""
+def _ask_openai(images: list[tuple[str, str]], user_text: str, system: str = None, *,
+                model: str = None, detail: str = "high", max_tokens: int = None, mime: str = "image/png") -> str:
+    """images = [(caption, base64), ...]"""
     from openai import OpenAI
     client = OpenAI()  # reads OPENAI_API_KEY
     content = []
     for caption, b64 in images:
         content.append({"type": "text", "text": caption})
         # "high" stops OpenAI from shrinking the picture, which blurs small handwriting
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}})
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": detail}})
     content.append({"type": "text", "text": user_text})
+    kwargs = {}
+    if max_tokens:
+        kwargs["max_tokens"] = max_tokens
     response = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=model or OPENAI_MODEL,
         response_format={"type": "json_object"},
         temperature=0,
         messages=[{"role": "system", "content": system or SYSTEM_PROMPT}, {"role": "user", "content": content}],
+        **kwargs,
     )
     return response.choices[0].message.content
 
@@ -205,8 +216,9 @@ def _gemini_models() -> list[str]:
     return models
 
 
-def _ask_gemini(images: list[tuple[str, str]], user_text: str, system: str = None) -> str:
-    """images = [(caption, base64_png), ...]. Uses the Gemini REST API, no extra package."""
+def _ask_gemini(images: list[tuple[str, str]], user_text: str, system: str = None, *,
+                max_tokens: int = None, mime: str = "image/png", **_ignored) -> str:
+    """images = [(caption, base64), ...]. Uses the Gemini REST API, no extra package."""
     import ssl
     import time
     import urllib.error
@@ -218,12 +230,15 @@ def _ask_gemini(images: list[tuple[str, str]], user_text: str, system: str = Non
     parts = []
     for caption, b64 in images:
         parts.append({"text": caption})
-        parts.append({"inlineData": {"mimeType": "image/png", "data": b64}})
+        parts.append({"inlineData": {"mimeType": mime, "data": b64}})
     parts.append({"text": user_text})
+    generation = {"temperature": 0, "responseMimeType": "application/json"}
+    if max_tokens:
+        generation["maxOutputTokens"] = max_tokens
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": system or SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+        "generationConfig": generation,
     }).encode()
     context = ssl.create_default_context(cafile=certifi.where())
     last_error = None
@@ -259,17 +274,18 @@ def _ask_gemini(images: list[tuple[str, str]], user_text: str, system: str = Non
     raise last_error or RuntimeError("Gemini is busy. Try again in a moment, or switch to OpenAI.")
 
 
-def _ask_claude(images: list[tuple[str, str]], user_text: str, system: str = None) -> str:
+def _ask_claude(images: list[tuple[str, str]], user_text: str, system: str = None, *,
+                max_tokens: int = None, mime: str = "image/png", **_ignored) -> str:
     import anthropic
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
     content = []
     for caption, b64 in images:
         content.append({"type": "text", "text": caption})
-        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": mime, "data": b64}})
     content.append({"type": "text", "text": user_text})
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=max_tokens or 4096,
         system=system or SYSTEM_PROMPT,
         messages=[{"role": "user", "content": content}],
     )
@@ -330,7 +346,7 @@ def ink_bbox(png_bytes: bytes, region=None):
     return (float(x1 + min(xs)), float(y1 + y0), float(x1 + max(xs) + 1), float(y1 + y1b))
 
 
-def close_up(png_bytes: bytes, strokes, pad=40, target=1100) -> bytes | None:
+def close_up(png_bytes: bytes, strokes, pad=40, target=1100, resample=Image.LANCZOS) -> bytes | None:
     """Crop to just the ink (no grid, no labels) and enlarge it, so digits are big and clean."""
     pts = [p for s in (strokes or []) for p in s]
     if not pts:
@@ -343,7 +359,7 @@ def close_up(png_bytes: bytes, strokes, pad=40, target=1100) -> bytes | None:
     crop = img.crop((x1, y1, x2, y2))
     scale = min(3.0, target / max(crop.width, crop.height))
     if scale > 1.05:
-        crop = crop.resize((int(crop.width * scale), int(crop.height * scale)), Image.LANCZOS)
+        crop = crop.resize((int(crop.width * scale), int(crop.height * scale)), resample)
     buf = io.BytesIO()
     crop.save(buf, format="PNG")
     return buf.getvalue()
@@ -369,20 +385,20 @@ def provider_name(provider: str = "openai") -> str:
     return f"OpenAI {OPENAI_MODEL}"
 
 
-def _dispatch(images, user_text, system, provider: str):
+def _dispatch(images, user_text, system, provider: str, **call):
     """Send the board to whichever model the buttons selected."""
     name = (provider or "openai").lower()
     if name == "gemini":
         if not os.environ.get("GEMINI_API_KEY"):
             raise RuntimeError("No Gemini key. Add GEMINI_API_KEY=... to backend/.env, save, and restart the server.")
-        return _parse_json(_ask_gemini(images, user_text, system))
+        return _parse_json(_ask_gemini(images, user_text, system, **call))
     if name == "claude":
         if not os.environ.get("ANTHROPIC_API_KEY"):
             raise RuntimeError("No Anthropic key. Add ANTHROPIC_API_KEY to backend/.env")
-        return _parse_json(_ask_claude(images, user_text, system))
+        return _parse_json(_ask_claude(images, user_text, system, **call))
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("No OpenAI key. Add OPENAI_API_KEY to backend/.env")
-    return _parse_json(_ask_openai(images, user_text, system))
+    return _parse_json(_ask_openai(images, user_text, system, **call))
 
 
 ACTION_TEXT = {
@@ -402,19 +418,136 @@ For a pattern, "work" is one line naming the rule, and "text" is still what to w
 {"mode": "hint", "description": "what is on the board", "reasoning": "what the next step is and why",
  "hint": "ONE short hint, max 15 words, that helps them take the next step without giving away the answer"}
 This works for maths, questions, patterns and drawings (e.g. "What do houses have on top?").""",
-    "check": """The person pressed CHECK MY WORK: they wrote problems AND their own answers. Respond with:
+    "check": """The person pressed CHECK MY WORK. Read THEIR problem, THEIR steps, and THEIR answer. Respond with:
 {"mode": "check", "description": "what is on the board", "reasoning": "anything you were unsure reading",
  "problems": [
-   {"expression": "5+4=10", "bbox": [x1, y1, x2, y2]},
-   {"equation": "2*x+3=7", "student_answer": "x=3", "bbox": [x1, y1, x2, y2]}
+   {"expression": "5+4=", "work": "5+4=10", "student_answer": "10",
+    "correct": false, "correct_answer": "9", "missing": "", "bbox": [x1, y1, x2, y2]},
+   {"equation": "2*x+3=7", "work": "2*x=4", "student_answer": null,
+    "correct": null, "correct_answer": "x=2", "missing": "They stopped before dividing by 2.",
+    "bbox": [x1, y1, x2, y2]}
  ]}
-- Arithmetic: "expression" is the whole line exactly as written, INCLUDING the student's answer.
-- Algebra: "equation" is the equation, "student_answer" is what they wrote as the solution (or null).
-- TRANSCRIBE EXACTLY what they wrote, even if it is wrong. Then YOU check it.
-  Add "correct": true, false, or null if they wrote no answer yet, and "correct_answer": the right result
-  as you compute it (e.g. "9" or "x=2").
-- "bbox" covers the problem and the student's answer. One entry per problem, top to bottom.""",
+- Copy every line they wrote, even when it is wrong or unfinished. Never replace their work with the right work.
+- "expression" or "equation" is the problem. "work" is their steps, one per line. "student_answer" is only their final result, or null if they did not finish.
+- "correct" is true, false, or null when no final answer is there. "correct_answer" is the right result.
+- "missing" says what they left out. Leave it empty when the work is complete.
+- "bbox" covers that problem and the work under it. One entry per problem, top to bottom.""",
 }
+
+
+FAST_PROMPT = """You read handwriting for a classroom whiteboard robot. Reply with ONLY a JSON object.
+
+Read left to right. These are usually digits, not letters: s/S=5, z/Z=2, l/I/|=1, o/O=0, g/q=9, b=6, B=8, T=7, t=+.
+An x between two numbers means multiply. Use * for multiply, / for divide, and ^ for powers.
+A blank is only an underscore or an empty box. Write it as _. A question mark is not a blank.
+
+Keep every period and every question mark.
+- A period is a dot sitting on the baseline. 3.14 is not 314. "Done." keeps the period.
+- A question mark is a curve with a separate dot underneath. Read both parts as one ?.
+  Do not drop that dot, and do not read it as its own period.
+- A line of words, with or without ? or ., is mode answer. It is not math and not a drawing.
+- Never use mode drawing. A photo of writing is still writing.
+
+{"mode":"math","description":"short","problems":[{"expression":"12+7="}]}
+Transcription only. Do not solve. Keep a trailing =. One object per problem, top to bottom. Never join problems.
+
+{"mode":"fill","description":"short","text":"what to write next","reasoning":"the rule in one line"}
+
+{"mode":"answer","question":"the words you read, keeping . and ?","answer":"short plain ASCII, max 15 words","reasoning":"one sentence"}
+
+{"mode":"hint","description":"short","hint":"one nudge, max 12 words, no final answer","reasoning":"one sentence"}
+
+{"mode":"check","description":"short","problems":[{"expression":"5+4=","work":"5+4=10","student_answer":"10","correct":false,"correct_answer":"9","missing":""}]}
+Read their problem, every step, and their final answer exactly, even if it is wrong or unfinished.
+student_answer is null when they did not finish. missing says what they left out, or "" when nothing is missing.
+correct is true, false, or null. correct_answer is the right result, such as 9 or x=2.
+"""
+
+PHOTO_READ = (
+    "This is a photo of a whiteboard, not a picture to finish. Read the handwriting. "
+    "Never respond with mode drawing. Keep every period (.) and question mark (?)."
+)
+
+FAST_ACTION = {
+    "answer": "They pressed Answer. Math or a number pattern: mode math or fill, and do not compute the result. "
+              "Written words, including any . or ?: mode answer. Never mode drawing.",
+    "work": "They pressed Show work. Transcribe math or a pattern and do not compute it. Written words: mode answer.",
+    "hint": "They pressed Hint. Respond with mode hint only.",
+    "check": "They pressed Check my work. Respond with mode check only. Copy the problem, every step, and their final answer exactly, even if it is wrong or unfinished. Say what is missing.",
+    "recommend": """They pressed Recommended action. Choose the one button that fits, then transcribe the board for that button.
+Pick exactly one recommend value:
+- check: they already wrote an answer or a finished result, even if it is wrong (2+2=5, x=3)
+- hint: they started steps and stopped before a final answer
+- work: the problem needs more than one step and they have not started (algebra, several operations, a long multiply)
+- answer: a short unfinished problem, a pattern, or a written question
+- drawing: a picture, not writing. Mode drawing is allowed here.
+Reply with {"recommend":"check","why":"one short sentence","mode":"check", ...the fields that mode needs}.
+For math, always include problems with expression, work, and student_answer copied exactly. student_answer is null if they did not finish.
+For a question, include question and a short answer. For a hint, include hint. For a picture, mode drawing and a short description only.""",
+}
+
+
+def fast_provider_name(provider: str = "openai") -> str:
+    name = (provider or "openai").lower()
+    if name == "gemini":
+        return f"Gemini {GEMINI_MODEL}"
+    if name == "claude":
+        return f"Claude {CLAUDE_MODEL}"
+    return f"OpenAI {OPENAI_MATH_MODEL}"
+
+
+def _jpeg_b64(png_bytes: bytes, max_edge: int) -> tuple[str, float]:
+    """Shrink a board photo to a JPEG. Returns (base64, scale applied to pixel coordinates)."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    scale = 1.0
+    edge = max(img.size)
+    if edge > max_edge:
+        scale = max_edge / edge
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))), Image.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return base64.b64encode(buf.getvalue()).decode(), scale
+
+
+def _scale_boxes(ai: dict, factor: float) -> None:
+    if factor == 1:
+        return
+    for prob in ai.get("problems") or []:
+        if not isinstance(prob, dict):
+            continue
+        for key in ("bbox", "blank_bbox"):
+            box = prob.get(key)
+            if isinstance(box, list) and len(box) >= 4:
+                prob[key] = [float(v) / factor for v in box[:4]]
+
+
+def read_fast(png_bytes: bytes, strokes=None, action: str = "", image_box=None, provider: str = "openai",
+              note: str = "") -> dict:
+    """One picture, a short prompt, and no solving. SymPy does the maths afterwards.
+
+    An uploaded photo is sent whole. A close-up was cutting the problem off.
+    """
+    if strokes and not image_box:
+        zoom = close_up(png_bytes, strokes, target=800, resample=Image.BILINEAR)
+        b64, _scale = _jpeg_b64(zoom or png_bytes, 900)
+        caption = "Close-up of the handwriting. Read the characters. Do not return coordinates."
+        scale = None
+    else:
+        b64, scale = _jpeg_b64(png_bytes, 1024)
+        caption = ("The whiteboard. Read each problem from top to bottom and include "
+                   "bbox [x1, y1, x2, y2] in these pixels.")
+    user = FAST_ACTION.get(action, FAST_ACTION["answer"])
+    if image_box:
+        user += "\n\n" + PHOTO_READ
+    if note and note.strip():
+        user += "\n\n" + note.strip()[:800]
+    call = {"max_tokens": 1200 if action in ("check", "recommend") else 700, "mime": "image/jpeg", "detail": "high"}
+    if (provider or "openai").lower() not in ("gemini", "claude"):
+        call["model"] = OPENAI_MATH_MODEL
+    ai = _dispatch([(caption, b64)], user, FAST_PROMPT, provider, **call)
+    if scale is not None:
+        _scale_boxes(ai, scale)
+    return ai
 
 
 IMAGE_TEXT = ("The whiteboard IS an uploaded picture filling x {0:.0f}-{2:.0f}, y {1:.0f}-{3:.0f}. "

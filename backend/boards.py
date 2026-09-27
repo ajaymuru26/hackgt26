@@ -27,7 +27,8 @@ MAX_POINTS = 120
 
 def configured() -> bool:
     _reload()
-    return bool(os.getenv("MONGODB_URI", "").strip())
+    uri = os.getenv("MONGODB_URI", "").strip()
+    return uri.startswith("mongodb://") or uri.startswith("mongodb+srv://")
 
 
 def remember(result, *, source, action="", provider="", user_strokes=None, heard="", seconds=0.0):
@@ -52,7 +53,7 @@ def remember(result, *, source, action="", provider="", user_strokes=None, heard
         thin = _thin(pts)
         if thin:
             strokes.append({"owner": "robot", "points": thin})
-    label = str(result.get("answer") or result.get("expression") or result.get("description") or source)
+    label = _title(result, heard, source)
     doc = {
         "created": datetime.now(timezone.utc),
         "source": source,
@@ -111,6 +112,33 @@ def get_board(board_id):
     return summary
 
 
+def _title(result, heard, source) -> str:
+    """A sentence you can read in the history list, not just the bare answer."""
+    names = {"math": "Math", "answer": "Question", "hint": "Hint", "check": "Check",
+             "fill": "Pattern", "drawing": "Drawing", "speak": "Voice", "ask": "Ask",
+             "write": "Writing", "trace": "Image"}
+    mode = str(result.get("mode") or source or "board")
+    kind = names.get(mode, mode[:1].upper() + mode[1:] if mode else "Board")
+    expr = str(result.get("expression") or "").strip()
+    answer = str(result.get("answer") or "").strip()
+    desc = str(result.get("description") or "").strip()
+    if heard:
+        body = heard
+    elif expr and answer and answer not in expr:
+        body = f"{expr} → {answer}"
+    elif expr:
+        body = expr
+    elif answer and desc and desc != answer:
+        body = f"{desc} → {answer}"
+    elif answer:
+        body = answer
+    elif desc:
+        body = desc
+    else:
+        body = "Saved board"
+    return f"{kind}: {body}"[:120]
+
+
 def _summary(doc):
     created = doc.get("created")
     return {
@@ -120,34 +148,48 @@ def _summary(doc):
         "action": doc.get("action") or "",
         "mode": doc.get("mode") or "",
         "label": doc.get("label") or "",
+        "answer": doc.get("answer") or "",
+        "description": doc.get("description") or "",
+        "expression": doc.get("expression") or "",
+        "heard": doc.get("heard") or "",
         "seconds": doc.get("seconds") or 0,
         "strokes": doc.get("stroke_count") if doc.get("stroke_count") is not None else len(doc.get("strokes") or []),
     }
 
 
 def _collection():
-    global _client, _uri, _indexed
+    global _client, _uri, _indexed, _down_until
+    if time.time() < _down_until:
+        return None
     _reload()
     uri = os.getenv("MONGODB_URI", "").strip()
-    if not uri:
+    if not uri.startswith("mongodb://") and not uri.startswith("mongodb+srv://"):
         return None
-    if _client is None or uri != _uri:
-        _client = MongoClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=2500)
-        _uri = uri
+    try:
+        if _client is None or uri != _uri:
+            _client = MongoClient(uri, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=2500)
+            _uri = uri
+            _indexed = False
+        name = os.getenv("MONGODB_DB", "").strip()
+        if name:
+            db = _client[name]
+        else:
+            try:
+                db = _client.get_default_database()
+            except PyMongoError:
+                db = _client["whiteboard"]
+        coll = db["boards"]
+        if not _indexed:
+            coll.create_index("created")
+            _indexed = True
+        return coll
+    except PyMongoError as e:
+        print(f"MongoDB unavailable: {e}")
+        _client = None
+        _uri = None
         _indexed = False
-    name = os.getenv("MONGODB_DB", "").strip()
-    if name:
-        db = _client[name]
-    else:
-        try:
-            db = _client.get_default_database()
-        except PyMongoError:
-            db = _client["whiteboard"]
-    coll = db["boards"]
-    if not _indexed:
-        coll.create_index("created")
-        _indexed = True
-    return coll
+        _down_until = time.time() + 30
+        return None
 
 
 def _reload():

@@ -26,9 +26,11 @@ import cv_finish
 import gcode
 import handwriting
 import math_solver
+import memory as student_memory
 import placement
 import robot as robot_link
 import shapes
+import speech
 import text_writer
 import tracer
 import vision
@@ -80,9 +82,13 @@ class TraceRequest(BaseModel):
     y: float
     w: float
     h: float
-    detail: str = "medium"     # low | medium | high
+    detail: str = "medium"     # low | medium | high | marker
     width: int = 1200
     height: int = 700
+
+
+class CropRequest(BaseModel):
+    image: str                 # the original photo, before it is stretched onto the board
 
 
 class TranscribeRequest(BaseModel):
@@ -128,8 +134,9 @@ def _from_prompt(ai, prompt, x, y, size, style, width, height, steps, prompt_str
         if not strokes:
             raise HTTPException(422, "The AI couldn't work out how to draw that. Try describing it differently.")
         steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, width, height)})
-        return {"mode": "drawing", "description": ai.get("description", "a drawing"), "answer": "", "strokes": strokes,
-                "prompt_strokes": prompt_strokes, "steps": steps,
+        return {"mode": "drawing", "description": ai.get("description", "a drawing"), "answer": "",
+                "say": explain_drawing(ai.get("description", prompt)),
+                "strokes": strokes, "prompt_strokes": prompt_strokes, "steps": steps,
                 "category": {"type": "Drawing", "detail": ai.get("description", prompt)}}
 
     answer = str(ai.get("answer", "")).strip()
@@ -160,8 +167,10 @@ def _from_prompt(ai, prompt, x, y, size, style, width, height, steps, prompt_str
     steps.append({"title": "Wrote the answer", "detail": f"\"{answer}\" {got.where}, in {written} line(s), "
                                                          "using a single-stroke pen font."})
     steps.append({"title": "Planned the robot", "detail": robot_summary(strokes, width, height)})
-    return {"mode": "answer", "description": prompt, "answer": answer, "strokes": strokes,
-            "prompt_strokes": prompt_strokes, "steps": steps, "category": {"type": "Answer", "detail": prompt}}
+    return {"mode": "answer", "description": prompt, "answer": answer,
+            "say": explain_answer(prompt, answer, ai.get("reasoning")),
+            "strokes": strokes, "prompt_strokes": prompt_strokes, "steps": steps,
+            "category": {"type": "Answer", "detail": prompt}}
 
 
 class GcodeRequest(BaseModel):
@@ -443,6 +452,78 @@ def stroke_rows(user_strokes, gap=10):
     return rows
 
 
+def _has_variable(text: str) -> bool:
+    """A letter that is still a letter after 3x4 is read as multiply."""
+    cleaned = re.sub(r"(\d)\s*[xX]\s*(\d)", r"\1*\2", text or "")
+    return bool(re.search(r"[A-Za-z]", cleaned))
+
+
+def pick_recommendation(ai: dict) -> tuple[str, str]:
+    """Which of the five buttons fits this board. The read can suggest one; the writing decides."""
+    suggested = str(ai.get("recommend") or "").strip().lower()
+    if suggested not in ("answer", "work", "hint", "check", "drawing"):
+        suggested = ""
+    why = " ".join(str(ai.get("why") or "").split())
+    mode = str(ai.get("mode") or "").strip().lower()
+    problems = [p for p in (ai.get("problems") or []) if isinstance(p, dict)]
+    answered = started = multi = False
+    saw_problem = False
+    for prob in problems:
+        expr = " ".join(str(prob.get("expression") or prob.get("equation") or "").split())
+        work = " ".join(str(prob.get("work") or "").split())
+        student = " ".join(str(prob.get("student_answer") or "").split())
+        if student.lower() in ("null", "none"):
+            student = ""
+        if not expr and not work and not student:
+            continue
+        saw_problem = True
+        if work and work.lower() not in ("null", "none"):
+            started = True
+        if student:
+            answered = True
+        if "=" in expr:
+            left, right = expr.split("=", 1)
+            if right.strip() and right.strip() not in ("_", "?") and not _has_variable(left):
+                answered = True
+        body = expr.split("=", 1)[0]
+        if len(re.findall(r"[+\-*/^]", body)) >= 2 or _has_variable(body):
+            multi = True
+        if re.search(r"\d{2,}\s*[*xX×]\s*\d{2,}", body):
+            multi = True
+    question = " ".join(str(ai.get("question") or "").split())
+    writing = saw_problem or bool(question) or mode in ("math", "fill", "answer", "hint", "check")
+    if (mode == "drawing" or suggested == "drawing") and not writing:
+        return "drawing", why or "It is a picture, so finish the drawing."
+    if answered:
+        return "check", why or "An answer is already written, so check the work."
+    if started:
+        return "hint", why or "The work is started and not finished, so give a hint."
+    if multi:
+        return "work", why or "This needs more than one step, so show the work."
+    if writing or suggested == "answer":
+        return "answer", why or "The problem is ready for an answer."
+    if suggested:
+        return suggested, why or "This is the closest fit for what is on the board."
+    return "drawing", why or "Nothing here reads as a problem, so finish the drawing."
+
+
+def picked_mode(ai, action: str) -> str:
+    """What to do with a read. A missing mode is not a drawing, and a question is not a picture."""
+    mode = str(ai.get("mode") or "").strip().lower()
+    question = str(ai.get("question") or "").strip()
+    if mode == "drawing" and action in ("answer", "work") and any(ch.isalpha() for ch in question):
+        return "answer"
+    if mode in ("math", "fill", "drawing", "answer", "hint", "check"):
+        return mode
+    if ai.get("problems") or str(ai.get("expression") or "").strip():
+        return "math"
+    if question or (action in ("answer", "work") and str(ai.get("answer") or "").strip()):
+        return "answer"
+    if str(ai.get("text") or "").strip():
+        return "fill"
+    return "drawing"
+
+
 def find_blank(expression, bbox, user_strokes):
     """Where is the blank? Look for an underscore-like stroke near where "_" sits in the text."""
     x1, y1, x2, y2 = bbox
@@ -476,6 +557,82 @@ def _separate_roots(answer: str) -> str:
     if len(parts) < 2 or any("=" in p for p in parts):
         return answer
     return " or ".join(f"{var}={p}" for p in parts)
+
+
+def solved_math(prob, expression) -> dict:
+    """SymPy first. The model's own answer is only a fallback when the transcription will not parse."""
+    try:
+        result = math_solver.solve(expression)
+    except Exception:
+        return math_from_ai(prob, expression)
+    result["answer"] = _separate_roots(result["answer"])
+    result["local"] = True
+    return result
+
+
+def check_shown(prob) -> str:
+    """The problem, the steps, and the answer, in the order they were written."""
+    parts = []
+    for key in ("expression", "equation", "work", "student_answer"):
+        text = prob.get(key)
+        if isinstance(text, list):
+            text = "\n".join(str(part) for part in text)
+        text = " ".join(str(text or "").split())
+        if text and text.lower() not in ("null", "none") and text not in parts:
+            parts.append(text)
+    return "\n".join(parts) if parts else "(blank)"
+
+
+def check_problems(ai) -> list:
+    """One problem per thing on the board, even when the read is not already a list."""
+    raw = ai.get("problems")
+    if isinstance(raw, dict):
+        raw = [raw]
+    problems = [p for p in (raw or []) if isinstance(p, dict)]
+    if problems:
+        return problems
+    expression = str(ai.get("expression") or ai.get("equation") or "").strip()
+    question = str(ai.get("question") or "").strip()
+    if not expression and any(ch.isdigit() for ch in question):
+        expression = question
+    if not expression:
+        return []
+    return [{
+        "expression": expression,
+        "equation": ai.get("equation"),
+        "work": ai.get("work"),
+        "student_answer": ai.get("student_answer"),
+        "correct": ai.get("correct"),
+        "correct_answer": ai.get("correct_answer"),
+        "missing": ai.get("missing"),
+        "bbox": ai.get("bbox"),
+    }]
+
+
+def model_grade(prob, shown: str) -> dict:
+    """What the read itself says, used when the writing cannot be checked exactly."""
+    correct = prob.get("correct")
+    if isinstance(correct, str):
+        correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
+    if not isinstance(correct, bool):
+        correct = None
+    fix = str(prob.get("correct_answer") or "").strip()
+    if fix.lower() in ("null", "none"):
+        fix = ""
+    missing = " ".join(str(prob.get("missing") or "").split())
+    if missing.lower() in ("null", "none"):
+        missing = ""
+    if correct is True:
+        return {"status": "correct", "correct_answer": fix, "note": "", "missing": "",
+                "detail": f"{shown} is correct."}
+    if correct is False:
+        detail = missing or (f"That is not right. The answer is {fix}." if fix else "That does not check out.")
+        note = missing or (f"not quite. Answer: {fix}" if fix else "that does not check out")
+        return {"status": "wrong", "correct_answer": fix, "note": note[:90], "missing": "", "detail": detail}
+    detail = missing or (f"The answer is missing. It should be {fix}." if fix else
+                         f"I read {shown}. I couldn't check it, so it is not marked wrong.")
+    note = missing or (f"answer is missing. It should be {fix}" if fix else "I couldn't check this line")
+    return {"status": "missing", "correct_answer": fix, "note": note[:90], "missing": detail, "detail": detail}
 
 
 def math_from_ai(prob, expression) -> dict:
@@ -571,13 +728,117 @@ def _reflected(req: CompleteRequest):
     return clean_strokes(raw, req.width, req.height), shapes.highlight_ids(), log
 
 
+def _plain(text) -> str:
+    """Math symbols as words, so the voice reads the working instead of the signs."""
+    t = " ".join(str(text or "").split())
+    for src, dst in (
+        ("**", " to the power of "),
+        ("^", " to the power of "),
+        ("×", " times "),
+        ("÷", " divided by "),
+        ("*", " times "),
+        ("/", " divided by "),
+        ("+", " plus "),
+        ("=", " equals "),
+        ("−", " minus "),
+        ("–", " minus "),
+    ):
+        t = t.replace(src, dst)
+    t = re.sub(r"(?<=\w)\s+x\s+(?=\w)", " times ", t, flags=re.I)
+    t = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " minus ", t)
+    return re.sub(r"\s+", " ", t).strip(" .")
+
+
+def explain_math(expression, answer, work="") -> str:
+    """A short spoken walkthrough: the problem, the steps, then the answer."""
+    problem = _plain(expression)
+    final = _plain(answer)
+    bits = [f"The problem is {problem}."] if problem else []
+    steps = []
+    seen = {problem.lower(), final.lower(), f"{problem} equals {final}".lower()}
+    for line in str(work or "").splitlines():
+        said = _plain(line)
+        if said and said.lower() not in seen:
+            seen.add(said.lower())
+            steps.append(said)
+    if steps:
+        bits.append("Here is how to get there. " + ". ".join(steps) + ".")
+    if final:
+        bits.append(f"The answer is {final}.")
+    return " ".join(bits)
+
+
+def explain_answer(question, answer, reasoning="") -> str:
+    q = " ".join(str(question or "").split())
+    a = " ".join(str(answer or "").split())
+    why = " ".join(str(reasoning or "").split())
+    bits = []
+    if q:
+        bits.append(q if q.endswith((".", "?", "!")) else f"{q}.")
+    if why and why.lower().rstrip(".") not in a.lower():
+        bits.append(why if why.endswith((".", "?", "!")) else f"{why}.")
+    if a:
+        bits.append(f"The answer is {a}.")
+    return " ".join(bits)
+
+
+def explain_drawing(description, plan="") -> str:
+    desc = " ".join(str(description or "this").split()) or "this"
+    idea = " ".join(str(plan or "").split())
+    line = f"I'm drawing {desc}."
+    if idea and idea.lower() not in desc.lower():
+        line += " " + (idea if idea.endswith((".", "?", "!")) else f"{idea}.")
+    return line
+
+
+def _say(result: dict) -> str:
+    """The script ElevenLabs reads while the robot draws."""
+    custom = " ".join(str(result.get("say") or "").split())
+    if custom:
+        return custom[:800]
+    mode = str(result.get("mode") or "")
+    if mode == "drawing":
+        return explain_drawing(result.get("description"), result.get("plan"))[:800]
+    if mode in ("text", "trace", ""):
+        return ""
+    answer = " ".join(str(result.get("answer") or "").split())
+    if not answer:
+        return ""
+    if mode == "math":
+        return explain_math(result.get("expression"), answer)[:800]
+    if mode == "hint" and not answer.lower().startswith("hint"):
+        return f"Hint. {answer}"[:800]
+    if mode == "answer":
+        return explain_answer(result.get("description"), answer)[:800]
+    return answer[:800]
+
+
+def _with_voice(result: dict) -> dict:
+    line = _say(result)
+    if not line:
+        return result
+    result["transcript"] = line
+    audio = speech.synthesize(line)
+    if audio:
+        result["speech"] = "data:audio/mpeg;base64," + base64.b64encode(audio).decode()
+    result.setdefault("steps", []).append({
+        "title": "Explaining the answer",
+        "detail": line,
+    })
+    return result
+
+
 @app.post("/api/complete")
 def complete(req: CompleteRequest):
     started = time.perf_counter()
     result = _complete(req)
+    for item in result.get("steps") or []:
+        if item.get("title") == "Recommended action":
+            result["recommended"] = str(item.get("detail") or "").split(".", 1)[0].strip()
+            break
     boards.remember(result, source="complete", action=req.action, provider=req.provider,
                     user_strokes=req.strokes, seconds=time.perf_counter() - started)
-    return result
+    return _with_voice(result)
 
 
 def _complete(req: CompleteRequest):
@@ -655,21 +916,87 @@ def _complete(req: CompleteRequest):
                 "plan": "Reflect the ink across its right edge, onto the right.",
                 "strokes": strokes, "highlight": highlight, "steps": steps, "category": category}
 
-    step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
-                                f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
+    prefetched = None
+    if req.action == "recommend":
+        step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)} "
+                                    "to choose among Answer, Show work, Hint, Check, and Finish drawing.")
+        started_rec = time.perf_counter()
+        try:
+            suggestion = vision.read_fast(png, req.strokes, "recommend", req.image_box, req.provider, "")
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"AI request failed: {e}")
+        steps[-1]["detail"] += f" It answered in {time.perf_counter() - started_rec:.1f} s."
+        if not isinstance(suggestion, dict):
+            suggestion = {}
+        chosen, why = pick_recommendation(suggestion)
+        labels = {"answer": "Answer", "work": "Answer but show work", "hint": "Hint",
+                  "check": "Check my work", "drawing": "Finish drawing"}
+        step("Recommended action", f"{labels[chosen]}. {why}")
+        req.action = chosen
+        if chosen in ("answer", "work"):
+            if suggestion.get("problems") or suggestion.get("expression"):
+                suggestion["mode"] = "math"
+            elif str(suggestion.get("text") or "").strip():
+                suggestion["mode"] = "fill"
+            elif str(suggestion.get("question") or suggestion.get("answer") or "").strip():
+                suggestion["mode"] = "answer"
+            prefetched = suggestion
+        elif chosen == "check":
+            suggestion["mode"] = "check"
+            prefetched = suggestion
+        elif chosen == "hint" and str(suggestion.get("hint") or suggestion.get("answer") or "").strip():
+            suggestion["mode"] = "hint"
+            prefetched = suggestion
+
+    fast = req.action in ("answer", "work", "hint", "check")
+    remembered = student_memory.hint_note() if req.action == "hint" else ""
+    if prefetched is None:
+        if fast:
+            step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)}. "
+                                        "The model only reads the handwriting. Math is solved on this computer.")
+        else:
+            step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
+                                        f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
+        looked = steps[-1]
+    else:
+        looked = None
     if req.action == "drawing" and note:
         step("Your instruction", f"\"{note}\"")
+    def unreadable_check(message):
+        """Check my work always answers. A failed read is a sentence on the board, not an error."""
+        step("Checked the writing", message)
+        strokes, _, _, where = write_below(message, layout, req.width, req.height, board)
+        if strokes:
+            step("Wrote the result", f"{message} {where}.")
+        category = {"type": "Check", "detail": message}
+        return {"mode": "check", "description": message, "answer": message, "say": message,
+                "strokes": strokes, "steps": steps, "category": category}
+
     started = time.perf_counter()
     try:
-        ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
-                                  req.image_box, req.provider, note if req.action == "drawing" else "")
+        if prefetched is not None:
+            ai = prefetched
+        elif fast:
+            ai = vision.read_fast(png, req.strokes, req.action, req.image_box, req.provider, remembered)
+        else:
+            ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
+                                      req.image_box, req.provider, note if req.action == "drawing" else "")
     except RuntimeError as e:
+        if req.action == "check":
+            return unreadable_check("I couldn't read the writing, so nothing is marked wrong.")
         raise HTTPException(500, str(e))
     except Exception as e:
+        if req.action == "check":
+            return unreadable_check("I couldn't read the writing, so nothing is marked wrong.")
         raise HTTPException(502, f"AI request failed: {e}")
-    steps[-1]["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
+    if looked is not None:
+        looked["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
+    if remembered:
+        step("Remembered this student", remembered)
 
-    mode = ai.get("mode", "drawing")
+    mode = picked_mode(ai, req.action)
     description = ai.get("description", "")
     names = {"math": "math", "fill": "pattern", "drawing": "drawing", "answer": "a question",
              "hint": "a hint", "check": "checking work"}
@@ -697,27 +1024,48 @@ def _complete(req: CompleteRequest):
         # Safety net: "1+1" looks like the letter H, so the AI may call math a drawing.
         # If it also read the strokes as math, math wins, and its own solution is what gets written.
         reading = str(ai.get("math_reading") or "").strip()
-        if mode != "math" and reading and reading.lower() not in ("null", "none") and any(ch.isdigit() for ch in reading):
+        if (mode != "math" and not (mode == "drawing" and req.image_box)
+                and reading and reading.lower() not in ("null", "none") and any(ch.isdigit() for ch in reading)):
             step("Changed its mind", f"The strokes also read as  {reading}  which is math. "
                                     "Handwritten math often looks like letters (1+1 looks like H), "
                                     "so treating it as math instead.")
             ai.setdefault("problems", [{"expression": reading, "answer": ai.get("math_answer"),
                                         "kind": ai.get("math_kind") or "evaluate"}])
             mode = "math"
+        if req.action in ("answer", "work") and mode == "drawing" and req.image_box:
+            step("Read it again", "The first pass called the photo a drawing. "
+                                  "Reading the writing again, and keeping periods and question marks.")
+            started_retry = time.perf_counter()
+            try:
+                ai = vision.read_fast(
+                    png, req.strokes, req.action, req.image_box, req.provider,
+                    note="The previous read was wrong. This is handwriting. Keep every period and the dot "
+                         "under each question mark. Respond with mode math or mode answer, never drawing.")
+            except RuntimeError as e:
+                raise HTTPException(500, str(e))
+            except Exception as e:
+                raise HTTPException(502, f"AI request failed: {e}")
+            steps[-1]["detail"] += f" The second read answered in {time.perf_counter() - started_retry:.1f} s."
+            mode = picked_mode(ai, req.action)
+            description = ai.get("description", description)
         if req.action in ("answer", "work") and mode == "drawing":
-            raise HTTPException(422, "I don't see a problem or question to answer. For pictures, use Finish drawing.")
+            raise HTTPException(422, "I couldn't read a problem or question there. "
+                                     "For a photo, press CV finish so only the whiteboard shows, then press Answer.")
     step("What it sees", description)
 
     if mode == "math":
         step("AI's notes", ai.get("reasoning"))
         problems = collect_problems(ai, layout)
-        strokes, answers, expressions, failed, types = [], [], [], [], []
+        strokes, answers, expressions, failed, types, scripts = [], [], [], [], [], []
+        rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12  # tighter when problems sit close together
         for n, prob in enumerate(problems, 1):
             expression = prob["expression"]
+            if len(rows) == len(problems):
+                prob["bbox"] = rows[n - 1]
             label = f"Problem {n}" if len(problems) > 1 else "The problem"
             try:
-                result = math_from_ai(prob, expression)
+                result = solved_math(prob, expression)
             except Exception:
                 failed.append(expression)
                 step(f"{label}: couldn't solve", f"Read it as  {expression}  but the AI did not give a solution. Skipping it.")
@@ -743,17 +1091,25 @@ def _complete(req: CompleteRequest):
                 else:
                     new, where = place_answer(expression, result, bbox, req.width, req.height, board, blank,
                                               req.strokes, near_y)
-                detail = f"Read  {expression}  and the AI solved it: {result['answer']}. Writing the working {where}."
+                who = "solved it here" if result.get("local") else "the AI solved it"
+                detail = f"Read  {expression}  and {who}: {result['answer']}. Writing the working {where}."
                 if shown:
                     detail += "\n" + shown
             else:
                 new, where = place_answer(expression, result, bbox, req.width, req.height, board, blank,
                                           req.strokes, near_y)
-                detail = f"Read  {expression}  and the AI solved it: {result['answer']}. Writing it {where}."
+                who = "solved it here" if result.get("local") else "the AI solved it"
+                detail = f"Read  {expression}  and {who}: {result['answer']}. Writing it {where}."
             strokes += new
             types.append(math_category(expression, result["kind"]))
             answers.append(result["answer"])
             expressions.append(expression)
+            spoken_work = ""
+            try:
+                spoken_work = math_solver.show_work(expression)
+            except Exception:
+                spoken_work = ""
+            scripts.append(explain_math(expression, result["answer"], spoken_work))
             step(f"{label}", detail)
         if not strokes:
             raise HTTPException(422, f"Read the math as {', '.join(failed) or 'nothing'} but the AI didn't give a solution. "
@@ -765,11 +1121,12 @@ def _complete(req: CompleteRequest):
             category = {"type": kinds_found[0], "detail": f"{len(types)} problems"}
         else:
             category = {"type": "Mixed math", "detail": ", ".join(f"{d} ({t.lower()})" for t, d in types)}
-        identify(category, "The AI's answer: "
+        identify(category, "Solved here: "
                  + "; ".join(f"{e} → {a}" for e, a in zip(expressions, answers)) + ".")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
         return {"mode": "math", "description": description, "expression": ";  ".join(expressions),
-                "answer": ", ".join(answers), "strokes": strokes, "steps": steps, "category": category}
+                "answer": ", ".join(answers), "say": " ".join(scripts),
+                "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "fill":
         text = str(ai.get("text", "")).strip()
@@ -803,8 +1160,10 @@ def _complete(req: CompleteRequest):
         category = {"type": "Number pattern" if numeric else "Pattern", "detail": description or "a sequence to continue"}
         identify(category, "It's a sequence, so the next items follow a rule instead of an equation.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "fill", "description": description, "answer": text, "strokes": strokes,
-                "steps": steps, "category": category}
+        why = " ".join(str(ai.get("reasoning") or "").split())
+        said = f"{why.rstrip('.')}. So the next part is {_plain(text)}." if why else f"The sequence continues with {_plain(text)}."
+        return {"mode": "fill", "description": description, "answer": text, "say": said,
+                "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "hint":
         hint = str(ai.get("hint") or ai.get("answer") or "").strip()
@@ -819,37 +1178,56 @@ def _complete(req: CompleteRequest):
         category = {"type": "Hint", "detail": description or "a nudge toward the next step"}
         identify(category, "You asked for a hint, so it points you to the next step instead of solving it.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "hint", "description": description, "answer": text, "strokes": strokes,
-                "steps": steps, "category": category}
+        why = " ".join(str(ai.get("reasoning") or "").split())
+        said = f"Hint. {why.rstrip('.')}. {hint}." if why else f"Hint. {hint}."
+        return {"mode": "hint", "description": description, "answer": text, "say": said,
+                "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "check":
-        step("AI's notes", ai.get("reasoning"))
-        problems = [p for p in (ai.get("problems") or []) if isinstance(p, dict)]
+        step("AI's notes", ai.get("reasoning") if isinstance(ai, dict) else "")
+        problems = check_problems(ai if isinstance(ai, dict) else {})
         if not problems:
-            raise HTTPException(422, "I couldn't find any problems with answers to check.")
+            return unreadable_check("I couldn't find a problem to check. Write the problem and your work, and I'll say if it's right, wrong, or what's missing.")
         everything = content_bbox(layout) or (40, 40, req.width - 40, 120)
-        strokes, right, wrong, empty = [], 0, 0, 0
+        strokes, right, wrong, missing = [], 0, 0, 0
+        said, notes = [], []
+        rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12
         for n, prob in enumerate(problems, 1):
-            label = f"Problem {n}" if len(problems) > 1 else "Your problem"
-            shown = prob.get("expression") or f"{prob.get('equation')}  ->  {prob.get('student_answer') or '(no answer)'}"
-            correct = prob.get("correct")
-            if isinstance(correct, str):
-                correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
-            if correct is None and str(prob.get("correct") or "").strip().lower() in ("null", "none", ""):
-                correct = None
-            fix = str(prob.get("correct_answer") or "").strip()
+          try:
+            if len(rows) == len(problems):
+                prob["bbox"] = rows[n - 1]
+            label = f"Problem {n}" if len(problems) > 1 else "Your work"
+            shown = check_shown(prob)
+            try:
+                judged = math_solver.grade_submission(
+                    expression=prob.get("expression"),
+                    equation=prob.get("equation"),
+                    student_answer=prob.get("student_answer"),
+                    work=prob.get("work"),
+                )
+            except Exception:
+                judged = None
+            if not judged:
+                judged = model_grade(prob, shown)
+            status = judged.get("status") or "missing"
+            fix = str(judged.get("correct_answer") or "").strip()
             x1, y1, x2, y2 = refine_bbox(prob.get("bbox") or everything, req.strokes, pad)
             size = min(max((y2 - y1) * 0.85, 28), 120)
-            if correct is None:
-                empty += 1
-                step(label, f"Read  {shown}  but there's no answer written yet, so nothing to mark.")
-                continue
             has_fix = bool(fix) and fix.lower() not in ("null", "none")
+            detail = str(judged.get("detail") or "").strip()
 
-            def mark(s, correct=correct, fix=fix, has_fix=has_fix):
+            if status == "missing":
+                missing += 1
+                note = str(judged.get("note") or detail or "the answer is missing")
+                notes.append(note)
+                said.append(detail or note)
+                step(label, f"Read\n{shown}\n{detail or note}")
+                continue
+
+            def mark(s, status=status, fix=fix, has_fix=has_fix):
                 """A check, or an X with the right answer beside it, drawn at the origin."""
-                if correct:
+                if status == "correct":
                     return handwriting.text_to_strokes("✓", 0, 0, s)
                 cross = handwriting.text_to_strokes("✗", 0, 0, s)
                 if not has_fix:
@@ -867,20 +1245,50 @@ def _complete(req: CompleteRequest):
             got = placement.place(board, mark, mark_spots, placement.shrinking(size, steps=3, factor=0.8),
                                   spot_first=True)
             strokes += got.strokes
-            if correct:
+            if status == "correct":
                 right += 1
-                step(label, f"Read  {shown}  and the AI checked it: correct. Marked it with a check {got.where}.")
+                said.append(detail or f"{shown} is correct.")
+                step(label, f"Read\n{shown}\nCorrect. Marked it with a check {got.where}.")
             else:
                 wrong += 1
-                step(label, f"Read  {shown}  and the AI checked it: not quite. The right answer is {fix or 'different'}, "
-                            f"so it gets an X{' with the correct answer' if has_fix else ''}, {got.where}.")
-        total = right + wrong
-        if not total:
-            raise HTTPException(422, "I didn't find any finished answers to check. Write your answer after the = sign.")
-        category = {"type": "Check", "detail": f"{right} of {total} correct" + (f", {empty} not answered yet" if empty else "")}
-        identify(category, "You asked to check your work, so the AI marked each answer.")
-        step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "check", "description": description, "answer": category["detail"], "strokes": strokes,
+                note = str(judged.get("note") or "").strip()
+                if note:
+                    notes.append(note)
+                fact = f"The student wrote {shown} and it was wrong. {detail}"
+                if student_memory.remember(fact):
+                    step("Remembered the mistake", "Stored it in Backboard so the next hint can bring it up.")
+                said.append(detail or note or f"{shown} is wrong.")
+                step(label, f"Read\n{shown}\n{detail} Marked it with an X{' and the correct answer' if has_fix else ''}, {got.where}.")
+          except Exception:
+            missing += 1
+            note = "I couldn't check this line, so it is not marked wrong."
+            notes.append(note)
+            said.append(note)
+            step(f"Problem {n}" if len(problems) > 1 else "Your work", note)
+        if notes:
+            try:
+                extra, _, _, where = write_below("\n".join(notes), layout, req.width, req.height, board)
+                strokes += extra
+                step("Wrote what to fix", f"Wrote it {where}:\n" + "\n".join(notes))
+            except Exception:
+                step("Wrote what to fix", "\n".join(notes))
+        if not strokes and not said:
+            return unreadable_check("I read the board, but I couldn't check that writing. Nothing is marked wrong.")
+        parts = []
+        total = right + wrong + missing
+        if total:
+            parts.append(f"{right} of {total} correct")
+        if wrong:
+            parts.append(f"{wrong} wrong")
+        if missing:
+            parts.append(f"{missing} missing")
+        summary = ", ".join(parts) if parts else "checked"
+        category = {"type": "Check", "detail": summary}
+        identify(category, "You asked to check your work, so each line is marked correct, wrong, or missing.")
+        if strokes:
+            step("Planned the robot", robot_summary(strokes, req.width, req.height))
+        return {"mode": "check", "description": description, "answer": summary,
+                "say": " ".join(said)[:800], "strokes": strokes,
                 "steps": steps, "category": category}
 
     if mode == "answer":
@@ -909,8 +1317,9 @@ def _complete(req: CompleteRequest):
                 category = {"type": "Question", "detail": question}
                 identify(category, "The answer is written on the same line as the problem in the picture.")
                 step("Planned the robot", robot_summary(strokes, req.width, req.height))
-                return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
-                        "steps": steps, "category": category}
+                return {"mode": "answer", "description": question, "answer": answer,
+                        "say": explain_answer(question, answer, ai.get("reasoning")),
+                        "strokes": strokes, "steps": steps, "category": category}
         strokes, size, written, where = write_below(answer_text, layout, req.width, req.height, board)
         if not strokes:
             raise HTTPException(422, "There's no room left on the board for the answer.")
@@ -920,8 +1329,9 @@ def _complete(req: CompleteRequest):
         category = {"type": "Question", "detail": question}
         identify(category, "It's written words asking something, so the robot answers it instead of solving or drawing.")
         step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "answer", "description": question, "answer": answer, "strokes": strokes,
-                "steps": steps, "category": category}
+        return {"mode": "answer", "description": question, "answer": answer,
+                "say": explain_answer(question, answer_text if req.action == "work" else answer, ai.get("reasoning")),
+                "strokes": strokes, "steps": steps, "category": category}
 
     step("Made a plan", ai.get("plan"))
     log = []
@@ -994,6 +1404,7 @@ def _complete(req: CompleteRequest):
     identify(category, "It's a picture rather than numbers or symbols, so it gets finished with shapes.")
     step("Planned the robot", robot_summary(strokes, req.width, req.height))
     return {"mode": "drawing", "description": description, "plan": ai.get("plan", ""),
+            "say": explain_drawing(description, ai.get("plan", "")),
             "strokes": strokes, "highlight": highlight, "checks": checks, "steps": steps, "category": category}
 
 
@@ -1035,7 +1446,7 @@ def ask(req: AskRequest):
     result = _ask(req)
     boards.remember(result, source="ask", provider=req.provider, user_strokes=req.strokes,
                     heard=req.prompt, seconds=time.perf_counter() - started)
-    return result
+    return _with_voice(result)
 
 
 def _ask(req: AskRequest):
@@ -1096,7 +1507,7 @@ def speak(req: SpeakRequest):
     result = _speak(req)
     boards.remember(result, source="speak", provider=req.provider, user_strokes=req.strokes,
                     seconds=time.perf_counter() - started)
-    return result
+    return _with_voice(result)
 
 
 def _speak(req: SpeakRequest):
@@ -1167,8 +1578,27 @@ def _speak(req: SpeakRequest):
         result["strokes"] = problem_strokes + result["strokes"]
         if solved_value and result.get("answer"):
             result["answer"] = f"{expr} = {solved_value}"
+            try:
+                result["say"] = explain_math(expr, solved_value, math_solver.show_work(expr))
+            except Exception:
+                result["say"] = explain_math(expr, solved_value)
     result["_heard"] = heard
     return result
+
+
+@app.post("/api/crop")
+def crop_board(req: CropRequest):
+    data = req.image.split(",", 1)[1] if req.image.startswith("data:") else req.image
+    try:
+        raw = base64.b64decode(data)
+        png = tracer.crop_whiteboard(raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(422, f"Couldn't crop that image ({e}).")
+    if png is None:
+        return {"cropped": False}
+    return {"cropped": True, "image": "data:image/png;base64," + base64.b64encode(png).decode()}
 
 
 @app.post("/api/trace")
@@ -1184,10 +1614,11 @@ def trace_image(req: TraceRequest):
     strokes = clean_strokes(strokes, req.width, req.height)
     if not strokes:
         raise HTTPException(422, "Couldn't find any clear lines in that image. Try High detail or a higher-contrast picture.")
-    why = ("It looks like line art on a light background, so it traces down the middle of each line "
-           "(each line drawn once) and outlines any solid filled areas."
-           if info["method"] == "centre lines" else
-           "It looks like a photo, so it traces the edges where light areas meet dark ones (Canny edge detection).")
+    why = {
+        "centre lines": "It looks like line art on a light background, so it traces down the middle of each line "
+                        "(each line drawn once) and outlines any solid filled areas.",
+        "marker": "Kept the dry-erase marker and left the photograph out. The board behind the ink is not drawn.",
+    }.get(info["method"], "It looks like a photo, so it traces the edges where light areas meet dark ones (Canny edge detection).")
     steps = [
         {"title": "Loaded your image", "detail": f"Placed it on the board at {req.w:.0f} x {req.h:.0f} px and shaded it in the background."},
         {"title": "Chose how to trace it", "detail": why},
@@ -1308,6 +1739,17 @@ def robot_command(req: RobotCommandRequest):
     except robot_link.RobotError as e:
         raise HTTPException(409, str(e))
     return {**robot_link.robot.status(), "reply": reply}
+
+
+@app.get("/api/host")
+def host_info():
+    """Where this copy is meant to be opened, once it is on Vultr behind a .tech name."""
+    return {
+        "public_url": os.environ.get("PUBLIC_URL", "").strip(),
+        "vultr": bool(os.environ.get("VULTR_API_KEY", "").strip()),
+        "backboard": student_memory.configured(),
+        "voice": speech.configured(),
+    }
 
 
 # Serve the frontend from the same server (must come after the API routes)

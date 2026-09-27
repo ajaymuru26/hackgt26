@@ -25,7 +25,7 @@ body {
 
 .wall {
   /* keep the whole board and tray visible without scrolling on laptop screens */
-  max-width: max(560px, min(1600px, calc((100vh - 250px) * 12 / 7 + 68px + 340px)));
+  max-width: max(560px, min(1840px, calc((100vh - 250px) * 12 / 7 + 68px + 340px + 240px)));
   margin: 0 auto;
   padding: 20px 20px 32px;
 }
@@ -50,12 +50,162 @@ h1 {
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
+  grid-template-columns: 240px minmax(0, 1fr) 320px;
   gap: 20px;
   align-items: start;
 }
 
+.history {
+  background: #fff;
+  border: 1px solid rgba(28, 34, 48, 0.12);
+  border-radius: 8px;
+  padding: 14px 12px 8px;
+  box-shadow: 0 6px 16px rgba(40, 55, 70, 0.12);
+  max-height: calc(100vh - 110px);
+  overflow-y: auto;
+}
+
+.history h2 {
+  margin: 0 0 10px;
+  font-size: 1.05rem;
+  color: var(--marker-black);
+}
+
 .stage { min-width: 0; }
+
+.side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 110px);
+  min-width: 0;
+}
+
+.machine {
+  flex: 0 0 auto;
+  background: #1c2230;
+  color: #d5dde6;
+  border-radius: 8px;
+  padding: 12px 12px 10px;
+  box-shadow: 0 6px 16px rgba(40, 55, 70, 0.18);
+}
+
+.machine-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.machine h2 {
+  margin: 0;
+  font-size: 1rem;
+  color: #fff;
+}
+
+.machine .tool {
+  background: #2a3342;
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.2);
+  padding: 4px 10px;
+}
+
+.machine-note {
+  margin: 6px 0 8px;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  color: #b7c2ce;
+}
+
+#machine {
+  display: block;
+  width: 100%;
+  height: 210px;
+  background: #12171f;
+  border-radius: 6px;
+}
+
+.machine-readout {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.2fr;
+  gap: 8px;
+  margin: 8px 0 0;
+}
+
+.machine-readout div {
+  background: #12171f;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+
+.machine-readout dt {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  color: #8ea0b3;
+}
+
+.machine-readout dd {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: #d6ff6b;
+}
+
+.machine-readout dd.is-down { color: #8eb6ff; }
+
+.machine-readout span {
+  margin-left: 4px;
+  font-size: 0.75rem;
+  color: #8ea0b3;
+}
+
+.machine-log {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  max-height: 88px;
+  overflow: auto;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.machine-log li {
+  margin: 0;
+  padding: 1px 0;
+  color: #c5d0db;
+}
+
+.machine-speeds {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.machine-speeds label {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: #d5dde6;
+}
+
+.machine-speeds input {
+  width: 100%;
+  accent-color: #d6ff6b;
+}
+
+.machine-speeds output {
+  min-width: 2.4em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: #d6ff6b;
+}
+
+.machine-speeds span { color: #8ea0b3; }
 
 /* Thought process panel: a sheet of paper pinned beside the board */
 .thoughts {
@@ -64,7 +214,8 @@ h1 {
   border-radius: 8px;
   padding: 16px 16px 8px;
   box-shadow: 0 6px 16px rgba(40, 55, 70, 0.12);
-  max-height: calc(100vh - 110px);
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -103,6 +254,25 @@ h1 {
 
 .thoughts-empty { margin: 0 0 8px; color: #6b7682; }
 .thoughts-empty[hidden] { display: none; }
+
+.transcript {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #f4f7f2;
+  border: 1px solid #d5e3cc;
+}
+.transcript[hidden] { display: none; }
+.transcript h3 {
+  margin: 0 0 4px;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #3d6b32;
+}
+.transcript p { margin: 0; color: #243028; overflow-wrap: anywhere; }
+.transcript-word.is-pending { color: #8b97a3; }
+.transcript-word.is-said { color: #173f8f; font-weight: 700; }
 
 .thought-list {
   list-style: none;
@@ -157,9 +327,9 @@ h1 {
   .thought { animation: none; }
 }
 
-@media (max-width: 1000px) {
+@media (max-width: 1100px) {
   .workspace { grid-template-columns: 1fr; }
-  .thoughts { max-height: none; }
+  .history, .thoughts { max-height: none; }
 }
 
 /* The board: brushed aluminum frame around a white surface */
@@ -212,21 +382,11 @@ h1 {
 
 .tools, .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.saved {
-  flex-basis: 100%;
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-
-.saved-label { margin: 0; color: var(--marker-black); }
-
-.saved-empty { margin: 0; color: var(--marker-black); }
+.saved-empty { margin: 0 0 8px; color: #6b7682; }
 
 .saved-list {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 8px;
   margin: 0;
   padding: 0;
@@ -234,10 +394,32 @@ h1 {
 }
 
 .saved-list button {
-  max-width: 28ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  white-space: normal;
+}
+
+.history-kind {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--marker-blue);
+}
+
+.history-title {
+  font-weight: 700;
+  color: var(--marker-black);
+  overflow-wrap: anywhere;
+}
+
+.history-when {
+  font-size: 0.78rem;
+  color: #6b7682;
 }
 
 .status {
@@ -453,6 +635,14 @@ select:focus-visible {
   color: #fff;
   box-shadow: none;
 }
+
+.recommend {
+  background: #0c5a44;
+  border-color: #0c5a44;
+  color: #fff;
+}
+
+.recommend:hover:not(:disabled) { background: #094a38; }
 
 .finish {
   background: var(--marker-blue);
