@@ -3,17 +3,17 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Whiteboard Finisher</title>
+  <title>EduSketch</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=11">
+  <link rel="stylesheet" href="style.css?v=13">
 </head>
 <body>
   <main class="wall">
     <header class="top">
-      <h1>Whiteboard Finisher</h1>
-      <p class="hint">Write a problem like <strong>12 + 7 =</strong> or start a drawing, then pick what the robot should do.</p>
+      <h1>EduSketch</h1>
+      <p class="hint">Write a problem and your work, then press <strong>Submit</strong>. The robot checks it, shows the steps, and writes a formula when one is needed.</p>
     </header>
 
     <div class="workspace">
@@ -36,72 +36,15 @@
         <button id="eraserBtn" class="tool" aria-pressed="false" title="Eraser (E)">
           <span class="cap cap-eraser" aria-hidden="true"></span>Eraser
         </button>
-        <button id="textBtn" class="tool" aria-pressed="false" title="Ask (T): click the board, type a prompt, the robot writes the answer">
-          <span class="cap cap-text" aria-hidden="true">?</span>Ask
-        </button>
-        <button id="imageBtn" class="tool" title="Upload a picture. It fills the board. CV finish crops it to the whiteboard. Answer traces the marker and solves it.">
-          <span class="cap cap-image" aria-hidden="true"></span>Image
-        </button>
-        <input id="imageInput" type="file" accept="image/*" hidden>
         <button id="undoBtn" class="tool" title="Undo (Ctrl+Z)">Undo</button>
         <button id="clearBtn" class="tool" title="Clear the board">Clear</button>
-        <button id="talkBtn" class="tool" aria-pressed="false" title="Talk: ElevenLabs hears you, then the robot draws what you said">
-          Talk
-        </button>
       </div>
 
       <p id="status" class="status" role="status" aria-live="polite"></p>
 
-      <div class="writer">
-        <span class="writer-label">Ask tool:</span>
-        <select id="askMode" aria-label="What the robot does with your prompt">
-          <option value="answer" selected>Answer my prompt</option>
-          <option value="exact">Write exactly what I type</option>
-        </select>
-        <select id="writeStyle" aria-label="Writing style">
-          <option value="print">Print</option>
-          <option value="cursive">Cursive</option>
-        </select>
-        <select id="writeSize" aria-label="Text size">
-          <option value="30">Small</option>
-          <option value="50" selected>Medium</option>
-          <option value="80">Large</option>
-        </select>
-
-      </div>
-
-      <div class="model-switch modes" role="group" aria-label="Which AI to ask">
-        <span class="modes-label">Model</span>
-        <button type="button" id="openaiBtn" class="mode is-on" aria-pressed="true">OpenAI</button>
-        <button type="button" id="geminiBtn" class="mode" aria-pressed="false">Gemini</button>
-      </div>
-
-      <label class="writer drawing-note">
-        <span class="writer-label">Fix the drawing</span>
-        <input id="drawingNote" type="text" maxlength="400" placeholder="e.g. add a roof and a door on the house" aria-label="How the robot should change the drawing">
-      </label>
-
       <div class="action-group" role="group" aria-label="What should the robot do">
-        <button class="action recommend" data-action="recommend" title="Look at the board and press the action that fits: answer, show work, hint, check, or finish the drawing">
-          <span class="action-label">Recommended action</span>
-        </button>
-        <button class="action finish" data-action="answer" title="Solve the maths, answer the question, or continue the pattern">
-          <span class="cap cap-blue" aria-hidden="true"></span><span class="action-label">Answer</span>
-        </button>
-        <button class="action" data-action="work" title="Solve it and write the steps on the board, not only the final result">
-          <span class="action-label">Answer but show work</span>
-        </button>
-        <button class="action" data-action="hint" title="A nudge toward the next step, without the answer">
-          <span class="action-label">Hint</span>
-        </button>
-        <button class="action" data-action="check" title="Mark your answers, and when one is wrong, point out the mistake">
-          <span class="action-label">Check my work</span>
-        </button>
-        <button class="action" data-action="drawing" title="Finish the picture on the board">
-          <span class="action-label">Finish drawing</span>
-        </button>
-        <button class="action" data-action="cv" title="With a photo up, crop it so only the whiteboard shows. With a drawing, finish the missing geometry.">
-          <span class="action-label">CV finish</span>
+        <button class="action finish" data-action="submit" title="Check the work, write the steps, and add a formula when the problem needs one">
+          <span class="action-label">Submit</span>
         </button>
         <label class="review-toggle" title="After the first version, the same five-item checklist runs at least twice. Each pass is listed in the thought process.">
           <input id="reviewToggle" type="checkbox" checked> Recheck at least twice
@@ -109,28 +52,8 @@
       </div>
 
       <div class="actions">
-        <label class="speed" for="speedSelect">Robot speed
-          <select id="speedSelect">
-            <option value="1">Real</option>
-            <option value="2">2x</option>
-            <option value="4" selected>4x</option>
-            <option value="10">10x</option>
-          </select>
-        </label>
         <button id="replayBtn" class="tool" disabled title="Watch the robot draw again">Replay</button>
         <button id="gcodeBtn" class="tool" disabled title="Download the robot's lines as G-code">Download G-code</button>
-      </div>
-
-      <div class="robot-bar" role="group" aria-label="Real robot">
-        <span class="writer-label">Robot:</span>
-        <select id="robotPort" aria-label="Robot port"></select>
-        <button id="robotConnect" class="tool" title="Connect to the plotter's Arduino (close the Arduino Serial Monitor first)">Connect</button>
-        <button id="robotSend" class="tool robot-send" disabled title="Draw the robot's latest lines on the real board">Send to robot</button>
-        <button id="robotPause" class="tool" disabled>Pause</button>
-        <button id="robotStop" class="tool robot-stop" disabled title="Stop immediately and lift the pen">Stop</button>
-        <button id="robotPen" class="tool" disabled title="Test the pen servo">Pen down</button>
-        <progress id="robotProgress" max="1" value="0" hidden></progress>
-        <span id="robotStatus" class="robot-status" role="status" aria-live="polite">Not connected</span>
       </div>
 
     </div>
@@ -170,7 +93,7 @@
         <h2 id="thoughtsTitle">Thought process</h2>
         <p id="problemType" class="problem-type" hidden></p>
       </div>
-      <p id="thoughtsEmpty" class="thoughts-empty">Press Finish it and the robot will explain each step it takes here.</p>
+      <p id="thoughtsEmpty" class="thoughts-empty">Press Submit and the robot will check the work and explain each step here.</p>
       <section id="transcript" class="transcript" hidden aria-live="polite">
         <h3>Transcript</h3>
         <p id="transcriptText"></p>
@@ -180,6 +103,6 @@
     </div>
     </div>
   </main>
-  <script src="app.js?v=11"></script>
+  <script src="app.js?v=14"></script>
 </body>
 </html>

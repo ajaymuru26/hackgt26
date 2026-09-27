@@ -26,9 +26,7 @@ let lastRobotStrokes = [];
 let lastSpeech = "";
 let robot = null;       // live simulator state while the robot is drawing
 let lastRobotObjs = [];  // stroke objects the robot added last time (for replay)
-let background = null;  // uploaded picture under the sketch and the answer: { img, x, y, w, h }
-let timedFrom = 0;      // start of an image run, so the status can show total time
-let provider = "openai"; // openai | gemini, set by the Model buttons
+const provider = "openai";
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -55,14 +53,6 @@ function drawStroke(c, s) {
   if (!pts.length) return;
   c.lineCap = "round";
   c.lineJoin = "round";
-  // White edge so the sketch and the answer stay readable on the photo
-  if (background && (s.owner === "robot" || s.owner === "user")) {
-    c.strokeStyle = "#ffffff";
-    c.fillStyle = "#ffffff";
-    c.lineWidth = LINE_WIDTH + 7;
-    if (traceStroke(c, pts) === "fill") c.fill();
-    else c.stroke();
-  }
   const ink = s.highlight ? "#159447" : COLORS[s.owner];
   c.strokeStyle = ink;
   c.fillStyle = ink;
@@ -73,16 +63,11 @@ function drawStroke(c, s) {
 
 function render() {
   ctx.clearRect(0, 0, W, H);
-  if (background) {
-    ctx.save();
-    ctx.drawImage(background.img, background.x, background.y, background.w, background.h);
-    ctx.restore();
-  }
   strokes.forEach((s) => drawStroke(ctx, s));
   if (current) drawStroke(ctx, current);
   if (robot) drawRobot(ctx);
   drawMachine();
-  $("empty").hidden = strokes.length > 0 || !!current || !!background;
+  $("empty").hidden = strokes.length > 0 || !!current;
 }
 
 function toBoard(e) {
@@ -104,7 +89,6 @@ function eraseAt(p) {
 
 canvas.addEventListener("pointerdown", (e) => {
   if (busy) return;
-  if (tool === "text") { e.preventDefault(); openTextBox(toBoard(e)); return; }
   canvas.setPointerCapture(e.pointerId);
   saveHistory();
   const p = toBoard(e);
@@ -143,11 +127,7 @@ function setTool(t) {
   $("eraserBtn").classList.toggle("is-on", t === "eraser");
   $("penBtn").setAttribute("aria-pressed", t === "pen");
   $("eraserBtn").setAttribute("aria-pressed", t === "eraser");
-  $("textBtn").classList.toggle("is-on", t === "text");
-  $("textBtn").setAttribute("aria-pressed", t === "text");
   canvas.classList.toggle("erasing", t === "eraser");
-  canvas.classList.toggle("texting", t === "text");
-  if (t !== "text") closeTextBox(true);
 }
 
 function undo() {
@@ -158,10 +138,9 @@ function undo() {
 
 $("penBtn").onclick = () => setTool("pen");
 $("eraserBtn").onclick = () => setTool("eraser");
-$("textBtn").onclick = () => setTool("text");
 $("undoBtn").onclick = undo;
 $("clearBtn").onclick = () => {
-  if (busy || (!strokes.length && !background)) return;
+  if (busy || !strokes.length) return;
   saveHistory();
   strokes = [];
   lastRobotStrokes = [];
@@ -169,7 +148,6 @@ $("clearBtn").onclick = () => {
   lastSpeech = "";
   showTranscript("");
   voice.pause();
-  background = null;
   $("gcodeBtn").disabled = true;
   $("replayBtn").disabled = true;
   setStatus("");
@@ -181,7 +159,6 @@ document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undo(); }
   else if (e.key.toLowerCase() === "p" && !e.ctrlKey && !e.metaKey) setTool("pen");
   else if (e.key.toLowerCase() === "e" && !e.ctrlKey && !e.metaKey) setTool("eraser");
-  else if (e.key.toLowerCase() === "t" && !e.ctrlKey && !e.metaKey) setTool("text");
 });
 
 function setStatus(text, kind = "") {
@@ -196,7 +173,7 @@ function setBusy(on) {
     b.disabled = on;
     if (!on) b.classList.remove("is-busy");
   });
-  ["undoBtn", "clearBtn", "textBtn", "imageBtn", "talkBtn"].forEach((id) => ($(id).disabled = on));
+  ["undoBtn", "clearBtn"].forEach((id) => ($(id).disabled = on));
   ["gcodeBtn", "replayBtn"].forEach((id) => ($(id).disabled = on || !lastRobotStrokes.length));
 }
 
@@ -208,8 +185,6 @@ function snapshot() {
   const c = off.getContext("2d");
   c.fillStyle = "#ffffff";
   c.fillRect(0, 0, W, H);
-  // The whole uploaded photo goes to the model. A close-up of the trace was cutting off the problem.
-  if (background) c.drawImage(background.img, background.x, background.y, background.w, background.h);
   strokes.forEach((s) => drawStroke(c, { ...s, owner: "user", highlight: false }));
   return off.toDataURL("image/png");
 }
@@ -263,24 +238,14 @@ async function showThoughts(steps) {
 const ACTION_WORDS = { answer: "Working out the answer", work: "Working out the steps",
                        hint: "Thinking of a hint",
                        check: "Checking your work", drawing: "Looking at your drawing",
+                       submit: "Checking your work",
                        recommend: "Choosing the action that fits",
                        cv: "Reading the ink with computer vision",
                        auto: "Reading the picture" };
 
-function placeAnswer(newStrokes) {
-  lastRobotObjs = [];
-  (newStrokes || []).forEach((pts) => {
-    const obj = { owner: "robot", points: pts };
-    strokes.push(obj);
-    lastRobotObjs.push(obj);
-  });
-  lastRobotStrokes = newStrokes || [];
-  render();
-}
-
-async function runAction(action, button, opts = {}) {
+async function runAction(action, button) {
   if (busy) return;
-  if (!strokes.length && !background) { setStatus("The board is empty. Write, draw, or add an image first.", "error"); return; }
+  if (!strokes.length) { setStatus("The board is empty. Write or draw something first.", "error"); return; }
   armSpeaker();
 
   setBusy(true);
@@ -289,28 +254,18 @@ async function runAction(action, button, opts = {}) {
   clearThoughts();
   const thinking = action === "cv" ? "Reading the ink with computer vision" : "Sending the board to the AI";
   const live = addThought("Thinking", `${thinking}… 0.0 s`, "live");
-  const t0 = timedFrom || performance.now();
-  timedFrom = 0;
+  const t0 = performance.now();
   const ticker = setInterval(() => {
     live.querySelector(".thought-detail").textContent =
       `${thinking}… ${((performance.now() - t0) / 1000).toFixed(1)} s`;
   }, 100);
   try {
-    // Read the photo before the marker ink is drawn on top of it.
     const image = snapshot();
-    if (action === "answer" && background && !background.marked) {
-      const ink = await markerInk(image);
-      ink.forEach((pts) => strokes.push({ owner: "user", points: pts }));
-      background.marked = true;
-      if (ink.length) render();
-    }
     const res = await fetch("/api/complete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image, width: W, height: H, action, review: opts.instant ? false : $("reviewToggle").checked,
-                             image_box: background ? imageBox() : null,
-                             strokes: strokes.map((s) => s.points), provider,
-                             instruction: action === "drawing" || action === "recommend" ? $("drawingNote").value.trim() : "" }),
+      body: JSON.stringify({ image, width: W, height: H, action, review: $("reviewToggle").checked,
+                             strokes: strokes.map((s) => s.points), provider }),
     });
     const data = await res.json().catch(() => ({}));
     clearInterval(ticker);
@@ -333,17 +288,6 @@ async function runAction(action, button, opts = {}) {
     (data.highlight || []).forEach((i) => {
       if (strokes[i] && strokes[i].owner === "user") strokes[i].highlight = true;
     });
-    if (opts.instant) {
-      placeAnswer(data.strokes);
-      (data.steps || []).forEach((s) => addThought(s.title, s.detail));
-      addThought("Runtime", `${runtime} s until writing`);
-      noteSaved(data);
-      showTranscript(data.transcript);
-      playSpeech(data.speech);
-      setStatus(`${recommended}${label}${checkNote} · ${runtime} s`, "robot");
-      await animateRobot(data.strokes, { ink: false, record: false });
-      return;
-    }
     await showThoughts(data.steps);
     setStatus(`${recommended}${label}${checkNote} · ${runtime} s`, "robot");
     addThought("Runtime", `${runtime} s until writing`);
@@ -370,490 +314,15 @@ async function runAction(action, button, opts = {}) {
 };
 
 document.querySelectorAll(".action").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    if (btn.dataset.action === "cv" && background) {
-      cropShown();
-      return;
-    }
-    // A photo is already the marker. Write the answer on it at once.
-    runAction(btn.dataset.action, btn, background ? { instant: true } : {});
-  });
-});
-
-// ---------- Text tool: click the board and type ----------
-let textBox = null; // the live input on the board
-
-function boardToCss([x, y]) {
-  const c = canvas.getBoundingClientRect();
-  const f = canvas.parentElement.getBoundingClientRect();
-  return [c.left - f.left + (x / W) * c.width, c.top - f.top + (y / H) * c.height, c.width / W];
-}
-
-function openTextBox(point) {
-  if (textBox) { closeTextBox(true); return; } // clicking away finishes the current box first
-  const size = Number($("writeSize").value);
-  const style = $("writeStyle").value;
-  const at = [point[0], Math.max(10, point[1] - size / 2)]; // centre the text on the click
-  const [left, top, scale] = boardToCss(at);
-  const input = document.createElement("input");
-  input.type = "text";
-  input.maxLength = 400;
-  input.className = "board-input";
-  input.setAttribute("aria-label", "Prompt for the robot");
-  input.placeholder = $("askMode").value === "answer" ? "Ask anything, then Enter" : "Type, then Enter";
-  input.style.left = `${left}px`;
-  input.style.top = `${top - size * scale * 0.25}px`;
-  input.style.fontSize = `${Math.max(14, size * scale * 1.35)}px`;
-  if (style === "cursive") input.style.fontStyle = "italic";
-  canvas.parentElement.append(input);
-  textBox = { input, at, size, style };
-
-  input.addEventListener("keydown", (e) => {
-    e.stopPropagation();
-    if (e.key === "Enter") { e.preventDefault(); closeTextBox(true); }
-    if (e.key === "Escape") { e.preventDefault(); closeTextBox(false); }
-  });
-  input.addEventListener("blur", () => setTimeout(() => {
-    if (textBox && textBox.input === input) closeTextBox(true);
-  }, 0));
-  requestAnimationFrame(() => input.focus());
-  setStatus("Type your prompt, then press Enter (Esc to cancel).", "robot");
-}
-
-function closeTextBox(submit) {
-  if (!textBox) return;
-  const { input, at, size, style } = textBox;
-  textBox = null;
-  const text = input.value.trim();
-  const askMode = $("askMode").value;
-  if (submit && text && askMode === "answer") {
-    // keep the prompt visible while the AI thinks; it becomes ink when the answer arrives
-    input.readOnly = true;
-    input.classList.add("is-waiting");
-    writeAt(at, { text, size, style, askMode, input });
-    return;
-  }
-  input.remove();
-  if (submit && text) writeAt(at, { text, size, style, askMode });
-  else setStatus("");
-}
-
-async function writeAt([x, y], job) {
-  if (busy) return;
-  armSpeaker();
-  setBusy(true);
-  clearThoughts();
-  const asking = job.askMode === "answer";
-  setStatus(asking ? "Thinking about your prompt…" : "Laying out the text…");
-  let live = null, ticker = null;
-  if (asking) {
-    live = addThought("Thinking", "Asking the AI… 0.0 s", "live");
-    const t0 = performance.now();
-    ticker = setInterval(() => {
-      live.querySelector(".thought-detail").textContent = `Asking the AI… ${((performance.now() - t0) / 1000).toFixed(1)} s`;
-    }, 100);
-  }
-  try {
-    const body = asking
-      ? { prompt: job.text, image: snapshot(), strokes: strokes.map((s) => s.points),
-          x, y, size: job.size, style: job.style, width: W, height: H, provider }
-      : { text: job.text, x, y, size: job.size, style: job.style, width: W, height: H };
-    const res = await fetch(asking ? "/api/ask" : "/api/write", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (ticker) { clearInterval(ticker); live.remove(); }
-    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
-    saveHistory(); // one Undo removes the prompt and the answer together
-    if (job.input) job.input.remove();
-    (data.prompt_strokes || []).forEach((pts) => strokes.push({ owner: "user", points: pts }));
-    render();
-    showProblemType(data.category);
-    await showThoughts(data.steps);
-    lastRobotStrokes = data.strokes;
-    setStatus(data.mode === "drawing" ? `Drawing ${data.description}` : data.answer ? `Writing: ${data.answer}` : "Writing", "robot");
-    noteSaved(data);
-    showTranscript(data.transcript);
-    playSpeech(data.speech);
-    const drawing = addThought(data.mode === "drawing" ? "Drawing" : "Writing", "The robot is on the board now.", "live");
-    await animateRobot(data.strokes);
-    drawing.classList.remove("is-live");
-    drawing.querySelector(".thought-title").textContent = "Done";
-    drawing.querySelector(".thought-detail").textContent = "Finished writing. Press Replay to watch again.";
-    setStatus(data.mode === "drawing" ? `Drew ${data.description}` : `Wrote: ${data.answer}`, "robot");
-  } catch (err) {
-    if (ticker) { clearInterval(ticker); live.remove(); }
-    if (job.input) job.input.remove();
-    setStatus(err.message, "error");
-    addThought("Something went wrong", err.message, "error");
-  } finally {
-    setBusy(false);
-  }
-}
-
-// ---------- Image: upload a picture, the robot draws over it ----------
-function loadImage(file) {
-  // Bake in the phone's rotation, then draw that bitmap. Otherwise a portrait photo
-  // is treated as landscape and the board shows a cropped slice.
-  if (typeof createImageBitmap === "function") {
-    return createImageBitmap(file, { imageOrientation: "from-image" }).catch(() => loadImageElement(file));
-  }
-  return loadImageElement(file);
-}
-
-function loadImageElement(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Couldn't read that file."));
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("That file isn't an image I can open."));
-      img.src = reader.result;
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-// Visible area of the uploaded picture, in board pixels. The whole photo fits on the board.
-function imageBox() {
-  if (!background) return null;
-  return [
-    Math.max(0, background.x),
-    Math.max(0, background.y),
-    Math.min(W, background.x + background.w),
-    Math.min(H, background.y + background.h),
-  ];
-}
-
-function imageFromUrl(url) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("Couldn't open that picture."));
-    img.src = url;
-  });
-}
-
-async function markerInk(image) {
-  try {
-    const res = await fetch("/api/trace", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image, x: 0, y: 0, w: W, h: H, detail: "marker", width: W, height: H }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) return [];
-    return (data.strokes || []).filter((pts) => {
-      if (!pts || pts.length < 2) return false;
-      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
-      return (Math.max(...xs) - Math.min(...xs)) < W * 0.9 || (Math.max(...ys) - Math.min(...ys)) < H * 0.9;
-    });
-  } catch {
-    return [];
-  }
-}
-
-async function cropShown() {
-  if (busy || !background || !background.source) return;
-  setBusy(true);
-  clearThoughts();
-  setStatus("Cropping to the whiteboard…");
-  try {
-    const res = await fetch("/api/crop", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: background.source }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
-    if (!data.cropped || !data.image) {
-      setStatus("Couldn't find a whiteboard in that picture. The whole photo stays up.", "error");
-      return;
-    }
-    const img = await imageFromUrl(data.image);
-    saveHistory();
-    strokes = [];
-    lastRobotStrokes = [];
-    lastRobotObjs = [];
-    lastSpeech = "";
-    showTranscript("");
-    background = { img, x: 0, y: 0, w: W, h: H, source: background.source };
-    render();
-    setStatus("Showing only the whiteboard. Press Answer when you want it solved.", "robot");
-  } catch (err) {
-    setStatus(err.message, "error");
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function placeImage(file) {
-  if (busy) return;
-  setBusy(true);
-  clearThoughts();
-  setStatus("Putting the picture on the board…");
-  try {
-    const source = await blobToDataUrl(file);
-    const img = await loadImage(file);
-    // The picture fills the board. CV crops it down to the whiteboard.
-    saveHistory();
-    strokes = [];
-    lastRobotStrokes = [];
-    lastRobotObjs = [];
-    lastSpeech = "";
-    showTranscript("");
-    background = { img, x: 0, y: 0, w: W, h: H, source };
-    timedFrom = 0;
-    render();
-    setStatus("Picture is on the board. Press CV finish to crop to the whiteboard.", "robot");
-  } catch (err) {
-    setStatus(err.message, "error");
-  } finally {
-    setBusy(false);
-  }
-}
-
-function setProvider(name) {
-  provider = name;
-  $("openaiBtn").classList.toggle("is-on", name === "openai");
-  $("geminiBtn").classList.toggle("is-on", name === "gemini");
-  $("openaiBtn").setAttribute("aria-pressed", String(name === "openai"));
-  $("geminiBtn").setAttribute("aria-pressed", String(name === "gemini"));
-  setStatus(name === "gemini" ? "Using Gemini" : "Using OpenAI", "robot");
-}
-
-$("drawingNote").addEventListener("keydown", (e) => {
-  if (e.key !== "Enter") return;
-  e.preventDefault();
-  const button = document.querySelector('.action[data-action="drawing"]');
-  runAction("drawing", button);
-});
-
-$("openaiBtn").onclick = () => setProvider("openai");
-$("geminiBtn").onclick = () => setProvider("gemini");
-
-$("imageBtn").onclick = () => $("imageInput").click();
-
-let recorder = null;
-let recordChunks = [];
-let recordTimer = 0;
-let heardLive = "";
-let hearThought = null;
-let speechRec = null;
-let captionTimer = 0;
-let captionBusy = false;
-
-function showHeard(text) {
-  const shown = text.replace(/\s+/g, " ").trim();
-  if (!shown) return;
-  heardLive = shown;
-  setStatus(shown, "robot");
-  if (!hearThought) hearThought = addThought("Hearing", shown, "live");
-  else hearThought.querySelector(".thought-detail").textContent = shown;
-}
-
-function startChunkedCaption() {
-  clearInterval(captionTimer);
-  captionTimer = setInterval(sendPartialCaption, 1000);
-}
-
-function stopChunkedCaption() {
-  clearInterval(captionTimer);
-  captionTimer = 0;
-}
-
-async function sendPartialCaption() {
-  if (captionBusy || !recorder || recorder.state !== "recording" || !recordChunks.length) return;
-  const type = recorder.mimeType || "audio/webm";
-  const blob = new Blob(recordChunks, { type });
-  if (blob.size < 2000) return;
-  captionBusy = true;
-  try {
-    const audio = await blobToDataUrl(blob);
-    const res = await fetch("/api/transcribe", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ audio, mime: type }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.text && recorder && recorder.state === "recording") showHeard(data.text);
-  } catch {
-    // The next tick tries again. Stop still sends the full recording.
-  } finally {
-    captionBusy = false;
-  }
-}
-
-function startLiveCaption() {
-  heardLive = "";
-  hearThought = null;
-  const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!Rec) {
-    startChunkedCaption();
-    return;
-  }
-  const rec = new Rec();
-  speechRec = rec;
-  rec.continuous = true;
-  rec.interimResults = true;
-  rec.lang = "en-US";
-  rec.onresult = (event) => {
-    let text = "";
-    for (let i = 0; i < event.results.length; i++) text += event.results[i][0].transcript;
-    showHeard(text);
-  };
-  rec.onerror = () => {
-    if (!heardLive) startChunkedCaption();
-  };
-  try {
-    rec.start();
-  } catch {
-    speechRec = null;
-    startChunkedCaption();
-  }
-}
-
-function stopLiveCaption() {
-  if (speechRec) {
-    speechRec.onresult = null;
-    speechRec.onerror = null;
-    try { speechRec.stop(); } catch { /* already stopped */ }
-    speechRec = null;
-  }
-  stopChunkedCaption();
-}
-
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Couldn't read the recording."));
-    reader.onload = () => resolve(reader.result);
-    reader.readAsDataURL(blob);
-  });
-}
-
-async function finishTalk(blob, mime) {
-  setBusy(true);
-  $("talkBtn").classList.remove("is-on");
-  $("talkBtn").setAttribute("aria-pressed", "false");
-  $("talkBtn").textContent = "Talk";
-  const said = heardLive;
-  clearThoughts();
-  hearThought = null;
-  if (said) addThought("You said", said);
-  setStatus(said ? `Heard: ${said}` : "Turning your voice into a drawing…");
-  const live = addThought("Thinking", said ? "Drawing what you said… 0.0 s" : "ElevenLabs is listening… 0.0 s", "live");
-  const t0 = performance.now();
-  const ticker = setInterval(() => {
-    const secs = ((performance.now() - t0) / 1000).toFixed(1);
-    live.querySelector(".thought-detail").textContent =
-      said ? `Drawing what you said… ${secs} s` : `ElevenLabs is listening… ${secs} s`;
-  }, 100);
-  try {
-    const audio = await blobToDataUrl(blob);
-    const res = await fetch("/api/speak", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        audio, mime, text: said, image: snapshot(), strokes: strokes.map((s) => s.points),
-        width: W, height: H, provider,
-      }),
-    });
-    const data = await res.json().catch(() => ({}));
-    clearInterval(ticker);
-    live.remove();
-    if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
-    saveHistory();
-    render();
-    showProblemType(data.category);
-    await showThoughts(data.steps);
-    lastRobotStrokes = data.strokes;
-    noteSaved(data);
-    showTranscript(data.transcript);
-    playSpeech(data.speech);
-    const drawing = addThought("Drawing", "The robot is drawing what you said.", "live");
-    await animateRobot(data.strokes);
-    drawing.classList.remove("is-live");
-    drawing.querySelector(".thought-title").textContent = "Done";
-    drawing.querySelector(".thought-detail").textContent = "Finished. Press Replay to watch again.";
-    setStatus(data.mode === "drawing" ? `Drew ${data.description}` : `Wrote: ${data.answer}`, "robot");
-  } catch (err) {
-    clearInterval(ticker);
-    live.remove();
-    setStatus(err.message, "error");
-    addThought("Something went wrong", err.message, "error");
-  } finally {
-    setBusy(false);
-  }
-}
-
-$("talkBtn").onclick = async () => {
-  if (busy) return;
-  if (recorder && recorder.state === "recording") {
-    armSpeaker();
-    recorder.stop();
-    return;
-  }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setStatus("This browser can't use the microphone.", "error");
-    return;
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mime = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
-    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
-    recordChunks = [];
-    recorder.ondataavailable = (e) => { if (e.data.size) recordChunks.push(e.data); };
-    recorder.onstop = () => {
-      clearTimeout(recordTimer);
-      stopLiveCaption();
-      stream.getTracks().forEach((track) => track.stop());
-      const type = recorder.mimeType || "audio/webm";
-      const blob = new Blob(recordChunks, { type });
-      finishTalk(blob, type);
-    };
-    recorder.start(400);
-    clearThoughts();
-    startLiveCaption();
-    $("talkBtn").classList.add("is-on");
-    $("talkBtn").setAttribute("aria-pressed", "true");
-    $("talkBtn").textContent = "Stop";
-    setStatus("Listening…", "robot");
-    recordTimer = setTimeout(() => { if (recorder && recorder.state === "recording") recorder.stop(); }, 20000);
-  } catch (err) {
-    setStatus(err.name === "NotAllowedError" ? "Allow the microphone, then click Talk again." : err.message, "error");
-  }
-};
-
-$("imageInput").addEventListener("change", (e) => {
-  const file = e.target.files[0];
-  e.target.value = ""; // lets you pick the same file again
-  if (file) placeImage(file);
+  btn.addEventListener("click", () => runAction(btn.dataset.action, btn));
 });
 
 // ---------- robot simulator ----------
-// Same greedy ordering as backend/gcode.py, so the simulation matches the real robot's path.
+// Strokes are drawn in the order the backend sent them, like backend/gcode.py: writing goes
+// line by line from the top (each line from left to right, the answer last); drawings come
+// already sorted nearest-first.
 function orderStrokes(list) {
-  const remaining = list.filter((s) => s.length >= 2).map((s) => s.slice());
-  const ordered = [];
-  let pos = HOME;
-  while (remaining.length) {
-    let best = 0, bestD = Infinity, flip = false;
-    remaining.forEach((s, i) => {
-      const dStart = Math.hypot(pos[0] - s[0][0], pos[1] - s[0][1]);
-      const dEnd = Math.hypot(pos[0] - s[s.length - 1][0], pos[1] - s[s.length - 1][1]);
-      if (dStart < bestD) { best = i; bestD = dStart; flip = false; }
-      if (dEnd < bestD) { best = i; bestD = dEnd; flip = true; }
-    });
-    let s = remaining.splice(best, 1)[0];
-    if (flip) s = s.reverse();
-    ordered.push(s);
-    pos = s[s.length - 1];
-  }
-  return ordered;
+  return list.filter((s) => s.length >= 2);
 }
 
 // A plan is the list of machine actions, like the G-code: travel, pen down, draw, pen up.
@@ -870,7 +339,7 @@ function buildPlan(list) {
 }
 
 function speedMultiplier() {
-  return Number($("speedSelect").value) || 4;
+  return 4;
 }
 
 const MARKER_MM = 8;
@@ -1029,14 +498,6 @@ function drawRobot(c) {
     c.beginPath();
     c.moveTo(last[0], last[1]);
     c.lineTo(x, y);
-    if (background) {
-      c.strokeStyle = "#ffffff";
-      c.lineWidth = LINE_WIDTH + 7;
-      c.stroke();
-      c.beginPath();
-      c.moveTo(last[0], last[1]);
-      c.lineTo(x, y);
-    }
     c.strokeStyle = ink;
     c.lineWidth = LINE_WIDTH;
     c.stroke();
@@ -1208,100 +669,6 @@ $("gcodeBtn").onclick = async () => {
   }
 };
 
-// ---------- the real robot ----------
-let plotter = { connected: false, state: "disconnected" };  // the real robot (`robot` is the on-screen one)
-let robotPoll = null;
-let penDown = false;
-
-async function robotApi(path, body) {
-  const res = await fetch("/api/robot/" + path, body === undefined ? {} : {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
-  return data;
-}
-
-async function loadRobotPorts() {
-  try {
-    const { ports } = await robotApi("ports");
-    const select = $("robotPort");
-    const keep = select.value;
-    select.innerHTML = "";
-    for (const p of ports) {
-      const opt = document.createElement("option");
-      opt.value = p.device;
-      opt.textContent = p.device === "sim" ? "Simulator" : `${p.device} (${p.description})`;
-      select.appendChild(opt);
-    }
-    // Prefer a real port when one is plugged in
-    const real = ports.find((p) => p.device !== "sim");
-    select.value = ports.some((p) => p.device === keep) ? keep : real ? real.device : "sim";
-  } catch (err) {
-    setRobotStatus("Couldn't list ports: " + err.message, true);
-  }
-}
-
-function setRobotStatus(text, error = false) {
-  const el = $("robotStatus");
-  el.textContent = text;
-  el.className = "robot-status" + (error ? " is-error" : "");
-}
-
-function showRobot(s) {
-  plotter = s;
-  const drawing = s.state === "drawing" || s.state === "paused";
-  $("robotConnect").textContent = s.connected ? "Disconnect" : "Connect";
-  $("robotPort").disabled = s.connected;
-  $("robotSend").disabled = !s.connected || drawing || !lastRobotStrokes.length;
-  $("robotPause").disabled = !drawing;
-  $("robotPause").textContent = s.state === "paused" ? "Resume" : "Pause";
-  $("robotStop").disabled = !drawing;
-  $("robotPen").disabled = !s.connected || drawing;
-  $("robotPen").textContent = penDown ? "Pen up" : "Pen down";
-  const bar = $("robotProgress");
-  bar.hidden = !drawing;
-  if (s.total) { bar.max = s.total; bar.value = s.sent; }
-  let text = s.error || s.message || (s.connected ? "Connected" : "Not connected");
-  if (drawing) text = `${s.state === "paused" ? "Paused" : "Drawing"}: line ${s.sent} of ${s.total}, pen at `
-                    + `${s.pos[0].toFixed(1)}, ${s.pos[1].toFixed(1)} mm` + (s.elapsed ? `, ${Math.round(s.elapsed)} s` : "");
-  setRobotStatus(text, !!s.error);
-  // Poll quickly while drawing, slowly otherwise, not at all when disconnected
-  clearTimeout(robotPoll);
-  if (s.connected) robotPoll = setTimeout(refreshRobot, drawing ? 400 : 2000);
-}
-
-async function refreshRobot() {
-  try { showRobot(await robotApi("status")); }
-  catch (err) { setRobotStatus("Lost contact with the server: " + err.message, true); }
-}
-
-async function robotAction(path, body, busyText) {
-  if (busyText) setRobotStatus(busyText);
-  try { showRobot(await robotApi(path, body)); return true; }
-  catch (err) { setRobotStatus(err.message, true); refreshRobot(); return false; }
-}
-
-$("robotConnect").onclick = () => plotter.connected
-  ? robotAction("disconnect", {})
-  : robotAction("connect", { port: $("robotPort").value }, "Connecting (the Arduino restarts, about 2 s)...");
-$("robotSend").onclick = () => {
-  if (!lastRobotStrokes.length) return;
-  robotAction("draw", { strokes: lastRobotStrokes, width: W, height: H }, "Sending...");
-};
-$("robotPause").onclick = () => robotAction(plotter.state === "paused" ? "resume" : "pause", {});
-$("robotStop").onclick = () => robotAction("stop", {}, "Stopping...");
-$("robotPen").onclick = async () => {
-  if (await robotAction("pen", { down: !penDown })) penDown = !penDown;
-  showRobot(plotter);
-};
-// "Send to robot" depends on there being robot lines, which change after every answer
-new MutationObserver(() => showRobot(plotter)).observe($("gcodeBtn"), { attributes: true, attributeFilter: ["disabled"] });
-
-loadRobotPorts().then(refreshRobot);
-
 const SILENCE = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
 const voice = new Audio(SILENCE);
 let lastTranscript = "";
@@ -1441,7 +808,6 @@ async function openSaved(id) {
     const res = await fetch(`/api/boards/${id}`);
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || `Server error ${res.status}`);
-    background = null;
     history = [];
     strokes = (data.strokes || []).map((s) => ({ owner: s.owner === "robot" ? "robot" : "user", points: s.points }));
     lastRobotObjs = strokes.filter((s) => s.owner === "robot");

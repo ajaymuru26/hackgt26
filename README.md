@@ -1,4 +1,4 @@
-# Whiteboard Finisher
+# EduSketch
 
 Draw on the whiteboard and press **Finish it**. The app can solve handwritten math,
 continue a pattern, finish a drawing, or answer a handwritten question. It can also

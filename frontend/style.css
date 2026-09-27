@@ -483,14 +483,6 @@ button:focus-visible {
 
 .writer-hint { color: #4b5663; font-size: 0.95rem; }
 
-.cap-image {
-  width: 16px;
-  height: 12px;
-  border: 2px solid var(--marker-black);
-  border-radius: 2px;
-  background: linear-gradient(135deg, transparent 55%, var(--marker-black) 55%);
-}
-
 .problem-type[data-type="Image trace"] { background: #fbe9e4; color: #7a2c16; }
 
 .cap-text {
@@ -627,13 +619,6 @@ select:focus-visible {
   background: #fff;
   border-color: var(--marker-black);
   box-shadow: 0 0 0 1px var(--marker-black) inset;
-}
-
-#talkBtn.is-on {
-  background: var(--marker-red);
-  border-color: var(--marker-red);
-  color: #fff;
-  box-shadow: none;
 }
 
 .recommend {

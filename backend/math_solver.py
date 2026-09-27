@@ -27,7 +27,136 @@ MISREAD_CHARS = set("sSzZlI|oOgqbGBT")
 
 
 def _parse(text: str):
+    if _OPERATOR.search(_d_over(text)):
+        return _parse_raw(text).doit()
     return parse_expr(text, transformations=TRANSFORMS, local_dict={"BLANK": BLANK})
+
+
+# d/dx, d/dt, d^2/dx^2 written as an operator. d/2 and 3/4 are not: the d must be followed by a letter.
+_OP = r"(?<![A-Za-z])d\s*(?:\^\s*(\d+)\s*)?/\s*d\s*([A-Za-z])"
+_OPERATOR = re.compile(_OP)
+_NEXT_OPERATOR = re.compile(r"[+\-]\s*(?=" + _OP.replace("(\\d+)", "\\d+").replace("([A-Za-z])", "[A-Za-z]") + ")")
+
+
+def _closing(text: str, start: int) -> int:
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    raise ValueError("unbalanced parentheses")
+
+
+def _leibniz(text: str) -> str:
+    """ "d/dx (x^2)" or "d/dx x^2" or "d(x^2)/dx"  ->  "Derivative((x^2),x)" so SymPy differentiates it."""
+    text = _d_over(text.replace("[", "(").replace("]", ")").replace("{", "(").replace("}", ")"))
+    text = re.sub(r"\(\s*(d\s*(?:\^\s*\d+\s*)?/\s*d\s*[A-Za-z](?:\s*\^\s*\d+)?)\s*\)", r"\1", text)
+    while True:
+        match = _OPERATOR.search(text)
+        if not match:
+            return text
+        order, var, end = match.group(1), match.group(2), match.end()
+        if order:
+            power = re.match(r"\s*\^\s*\d+", text[end:])
+            if power:
+                end += power.end()
+        rest = text[end:]
+        lead = re.match(r"\s*(?:of\s+)?", rest).end()
+        if rest[lead:lead + 1] == "(":
+            close = _closing(rest, lead)
+            operand, after = rest[lead + 1:close], rest[close + 1:]
+        else:
+            more = _NEXT_OPERATOR.search(rest, lead)
+            cut = more.start() if more else len(rest)
+            operand, after = rest[lead:cut], rest[cut:]
+        if not operand.strip():
+            raise ValueError("nothing to differentiate")
+        count = f",{order}" if order else ""
+        text = f"{text[:match.start()]}Derivative(({operand}),{var}{count}){after}"
+
+
+def _d_over(text: str) -> str:
+    """ "d(x^3)/dx"  ->  "d/dx(x^3)" """
+    start = 0
+    while True:
+        match = re.compile(r"(?<![A-Za-z])d\s*\(").search(text, start)
+        if not match:
+            return text
+        try:
+            close = _closing(text, match.end() - 1)
+        except ValueError:
+            return text
+        tail = re.match(r"\s*/\s*d\s*([A-Za-z])", text[close + 1:])
+        if not tail:
+            start = match.end()
+            continue
+        inner = text[match.end():close]
+        text = f"{text[:match.start()]}d/d{tail.group(1)}({inner}){text[close + 1 + tail.end():]}"
+
+
+def _parse_raw(text: str):
+    """Like _parse, but a derivative stays unevaluated so the steps can show it."""
+    return parse_expr(_leibniz(text), transformations=TRANSFORMS, local_dict={"BLANK": BLANK})
+
+
+def _dy_dx(expr: str) -> str:
+    """ "y=x^2, dy/dx" or "d(x^2)/dx"  ->  "d/dx(x^2)". dy/dx on its own is left alone."""
+    expr = _d_over(expr)
+    wants = r"d\s*(?P<dep>[A-Za-z])\s*/\s*d\s*(?P<var>[A-Za-z])"
+    defined = r"(?P<name>[A-Za-z])\s*=\s*(?P<body>[^,;=]+?)"
+    for pattern in (rf"^\s*{defined}\s*[,;:]?\s*(?:find\s+)?{wants}\s*=?\s*$",
+                    rf"^\s*(?:find\s+)?{wants}\s*[,;:]?\s*(?:of\s+|for\s+|if\s+|when\s+)?{defined}\s*=?\s*$"):
+        match = re.match(pattern, expr, flags=re.I)
+        if match and match.group("dep") == match.group("name") and match.group("dep") != match.group("var"):
+            return f"d/d{match.group('var')}({match.group('body').strip()})"
+    return expr
+
+
+def is_derivative(expression: str) -> bool:
+    """True when the problem is a d/dx derivative, not a fraction."""
+    try:
+        return bool(_OPERATOR.search(_dy_dx(_clean(str(expression or "")))))
+    except Exception:
+        return False
+
+
+def format_expr(value) -> str:
+    """3*x**2 + 2  ->  "3x^2+2"   (so the robot can write it)"""
+    if value.is_number:
+        return format_number(value)
+    text = str(value).replace("**", "^").replace(" ", "")
+    text = re.sub(r"exp\(([A-Za-z0-9]+)\)", r"e^\1", text)
+    return re.sub(r"(?<=[\d)])\*(?=[A-Za-z(])", "", text)
+
+
+def _tidy(value, var):
+    try:
+        sp.Poly(value, var)
+        return sp.expand(value)
+    except sp.PolynomialError:
+        return sp.simplify(value)
+
+
+def _operator_name(var, order: int = 1) -> str:
+    return f"d/d{var}" if order == 1 else f"d^{order}/d{var}^{order}"
+
+
+def _solve_derivative(expr: str) -> dict:
+    left, _, right = expr.partition("=")
+    if not _OPERATOR.search(left) and _OPERATOR.search(right):
+        left, right = right, left
+    raw = _parse_raw(left)
+    variables = sorted(raw.atoms(sp.Derivative), key=str)
+    var = variables[0].variables[0] if variables else None
+    value = raw.doit()
+    value = _tidy(value, var) if var is not None else sp.simplify(value)
+    if right.strip():
+        same = sp.simplify(value - _parse(right)) == 0
+        return {"kind": "check", "answer": "✓" if same else "✗"}
+    return {"kind": "derivative", "answer": format_expr(value), "var": var.name if var is not None else ""}
 
 
 def _clean(expr: str) -> str:
@@ -76,9 +205,17 @@ def _solve_for(eq, var) -> dict:
     raise ValueError("no solution")
 
 
+_INTEGRAL = re.compile(r"∫|\bintegral\b|\bint\s*[_(^]", re.I)
+
+
 def solve(expression: str) -> dict:
-    """Returns {"kind": "evaluate"|"solve", "answer": str}. Raises ValueError if unreadable."""
-    expr = _clean(expression)
+    """Returns {"kind": "evaluate"|"solve"|"derivative"|..., "answer": str}. Raises ValueError if unreadable."""
+    if _INTEGRAL.search(str(expression or "")):
+        # the _ in int_0^1 would otherwise be read as a blank to fill in
+        raise ValueError("integrals are not solved here")
+    expr = _dy_dx(_clean(expression))
+    if _OPERATOR.search(expr):
+        return _solve_derivative(expr.rstrip("=").strip() if expr.count("=") == 1 and expr.endswith("=") else expr)
     if "=" in expr and expr.split("=", 1)[1].strip():
         lhs_text, rhs_text = expr.split("=", 1)
         lhs, rhs = _parse(lhs_text), _parse(rhs_text)
@@ -116,13 +253,45 @@ def solve(expression: str) -> dict:
     return {"kind": "evaluate", "answer": format_number(sp.simplify(value))}
 
 
+def relevant_formula(expression: str) -> str:
+    """A formula the robot should write, or "" when the steps are enough on their own.
+
+    Plain arithmetic does not get one. A quadratic does, with a, b, and c filled in.
+    """
+    text = _dy_dx(_clean(expression or ""))
+    if not text:
+        return ""
+    if _OPERATOR.search(text):
+        return _derivative_formula(text)
+    if "=" in text and text.split("=", 1)[1].strip():
+        left, right = text.split("=", 1)
+        value = sp.expand(_parse(left) - _parse(right))
+    else:
+        value = sp.expand(_parse(text.rstrip("=")))
+    symbols = [s for s in sorted(value.free_symbols, key=lambda s: s.name) if s != BLANK]
+    if len(symbols) != 1:
+        return ""
+    var = symbols[0]
+    try:
+        poly = sp.Poly(value, var)
+    except sp.PolynomialError:
+        return ""
+    if poly.degree() != 2:
+        return ""
+    a, b, c = (sp.simplify(coeff) for coeff in poly.all_coeffs())
+    return (f"formula: {var.name} = (-b +- sqrt(b^2 - 4ac)) / (2a)\n"
+            f"a = {format_number(a)}, b = {format_number(b)}, c = {format_number(c)}")
+
+
 def show_work(expression: str, limit: int | None = 5) -> str:
     """Plain lines of working for the robot to write under the problem.
 
     limit is how many arithmetic lines to keep. None keeps every step.
     """
     result = solve(expression)
-    expr = _clean(expression).rstrip("=").strip()
+    expr = _dy_dx(_clean(expression)).rstrip("=").strip()
+    if _OPERATOR.search(expr):
+        return _derivative_steps(expr, limit)
     if result["kind"] == "evaluate":
         return _arithmetic_steps(expr, result["answer"], limit)
     if result["kind"] == "solve":
@@ -130,6 +299,49 @@ def show_work(expression: str, limit: int | None = 5) -> str:
     if result["kind"] == "blank":
         return f"the blank is {result['answer']}"
     return result["answer"]
+
+
+def _derivative_formula(text: str) -> str:
+    """The power rule when the thing being differentiated has a power in it, otherwise nothing."""
+    try:
+        raw = _parse_raw(text.split("=", 1)[0])
+    except Exception:
+        return ""
+    for part in raw.atoms(sp.Derivative):
+        var = part.variables[0]
+        if any(p.base == var for p in part.expr.atoms(sp.Pow)):
+            return f"formula: d/d{var.name} ({var.name}^n) = n{var.name}^(n-1)"
+    return ""
+
+
+def _derivative_steps(expr: str, limit: int | None = 5) -> str:
+    """d/dx (x^3+2x): each term's derivative, then the whole thing."""
+    left = next((side.strip() for side in expr.split("=") if _OPERATOR.search(side)), expr)
+    raw = _parse_raw(left)
+    parts = sorted(raw.atoms(sp.Derivative), key=str)
+    var = parts[0].variables[0] if parts else None
+    answer = format_expr(_tidy(raw.doit(), var) if var is not None else sp.simplify(raw.doit()))
+    if not isinstance(raw, sp.Derivative):
+        return f"{left} = {answer}"
+    order = len(raw.variables)
+    operand = raw.expr
+    name = _operator_name(var.name, order)
+    lines = []
+    if order > 1:
+        current = operand
+        for _ in range(order):
+            nxt = _tidy(sp.diff(current, var), var)
+            lines.append(f"{_operator_name(var.name)} ({format_expr(current)}) = {format_expr(nxt)}")
+            current = nxt
+    else:
+        terms = operand.as_ordered_terms() if isinstance(operand, sp.Add) else [operand]
+        if 1 < len(terms) <= 4:
+            for term in terms:
+                lines.append(f"{name} ({format_expr(term)}) = {format_expr(_tidy(sp.diff(term, var), var))}")
+    lines.append(f"{name} ({format_expr(operand)}) = {answer}")
+    if limit is not None and len(lines) > limit:
+        lines = lines[:max(limit - 1, 0)] + lines[-1:]
+    return "\n".join(lines)
 
 
 def _long_multiply(a: int, b: int) -> list[str]:
@@ -219,9 +431,9 @@ def _algebra_steps(expr: str, answer: str, limit: int | None = 5) -> str:
         if factored != diff:
             lines.append(f"{factored} = 0".replace("**", "^").replace("*", ""))
     lines.append(answer)
-    if limit is None:
-        return "\n".join(lines)
-    return "\n".join(lines[:limit])
+    if limit is not None and len(lines) > limit:
+        lines = lines[:max(limit - 1, 0)] + lines[-1:]
+    return "\n".join(lines)
 
 
 def _coeff_term(coeff, name: str) -> str:
@@ -237,6 +449,9 @@ def classify(expression: str, result: dict) -> tuple[str, str]:
     """Name the type of problem from how SymPy solved it (more reliable than asking the AI)."""
     expr = _clean(expression)
     kind = result["kind"]
+    if kind == "derivative" or is_derivative(expr):
+        var = result.get("var") or "x"
+        return "Calculus", f"derivative with respect to {var}"
     if kind == "solve":
         if "=" in expr and expr.split("=", 1)[1].strip():
             lhs_text, rhs_text = expr.split("=", 1)
@@ -388,6 +603,26 @@ def _answers_match(student: str, correct_answer: str) -> bool:
     return bool(left) and left == right
 
 
+def _gives(line: str, answer: str) -> bool:
+    try:
+        return _answers_match(line, answer)
+    except Exception:
+        return re.sub(r"\s+", "", line.split("=")[-1]) == re.sub(r"\s+", "", answer.split("=")[-1])
+
+
+def answer_last(work: str, answer: str) -> str:
+    """Lines of working that end on the answer. A bare answer written before the steps
+    (x = 3 on the first line) is moved to the end instead of being written twice."""
+    lines = [line for line in str(work or "").splitlines() if line.strip()]
+    answer = str(answer or "").strip()
+    if not answer or answer.lower() in ("null", "none", "✓", "✗"):
+        return "\n".join(lines)
+    if lines and _gives(lines[-1], answer):
+        return "\n".join(lines)
+    lines = [line for line in lines if not (_final_answer(line) and _gives(line, answer))]
+    return "\n".join(lines + [answer])
+
+
 def _assignment(correct_answer: str) -> dict:
     subs = {}
     for piece in re.split(r"\bor\b|,", _clean(str(correct_answer or ""))):
@@ -409,6 +644,8 @@ def _step_holds(step: str, subs: dict):
     if not right.strip():
         return None
     diff = sp.simplify(_parse(left) - _parse(right))
+    if _OPERATOR.search(_d_over(step)):
+        return bool(diff == 0)
     if subs:
         diff = sp.simplify(diff.subs(subs))
     if diff.free_symbols:
@@ -550,6 +787,9 @@ def _grade_problem(problem: str, student: str, steps) -> dict | None:
     if not problem and not student:
         return None
 
+    if problem and is_derivative(problem):
+        problem, student, steps = _derivative_claim(problem, student, steps)
+
     if problem and not student:
         try:
             judged = check_work(expression=problem)
@@ -566,7 +806,7 @@ def _grade_problem(problem: str, student: str, steps) -> dict | None:
                 del steps[i]
                 break
 
-    if not student:
+    if not student and not is_derivative(problem):
         for step in reversed(steps):
             if "=" not in step:
                 continue
@@ -614,6 +854,47 @@ def _grade_problem(problem: str, student: str, steps) -> dict | None:
     return finish(_pack_grade("wrong", answer, bug["note"], bug["detail"]))
 
 
+def _derivative_claim(problem: str, student: str, steps):
+    """d/dx(x^2)=2x is the problem d/dx(x^2) with the answer 2x. So is a last line like = 2x."""
+    problem = _dy_dx(_clean(problem))
+    left, _, right = problem.partition("=")
+    if not _OPERATOR.search(left) and _OPERATOR.search(right):
+        left, right = right, left
+    problem = left.strip()
+    if not student and right.strip():
+        student = right.strip()
+    if not student:
+        whole = _parse(problem)
+        for i in range(len(steps) - 1, -1, -1):
+            sides = _dy_dx(_clean(steps[i])).split("=")
+            tail = sides[-1].strip()
+            if not tail or _OPERATOR.search(tail) or re.fullmatch(r"d\s*[A-Za-z]\s*/\s*d\s*[A-Za-z]", tail):
+                continue
+            try:
+                # d/dx(2x)=2 is one term of d/dx(x^3+2x), not the final answer.
+                if any(_OPERATOR.search(side) and sp.simplify(_parse(side) - whole) != 0 for side in sides[:-1]):
+                    continue
+            except Exception:
+                continue
+            student = tail
+            steps = steps[:i] + steps[i + 1:]
+            break
+    return problem, student, steps
+
+
+def with_derivative(problem: str, others=()) -> str:
+    """The problem y=x^2 with dy/dx written in the work is the derivative d/dx(x^2)."""
+    match = re.fullmatch(r"\s*([A-Za-z])\s*=\s*(.+?)\s*", _clean(problem or ""))
+    if not match:
+        return problem
+    name, body = match.groups()
+    for text in _chunks(list(others)):
+        asked = re.search(rf"d\s*{name}\s*/\s*d\s*([A-Za-z])", str(text or ""))
+        if asked and asked.group(1) != name:
+            return f"d/d{asked.group(1)}({body})"
+    return problem
+
+
 def _grade_submission(expression, equation, student_answer, work) -> dict | None:
     student = _blank(student_answer)
     problem = _blank(equation)
@@ -646,6 +927,8 @@ def _grade_submission(expression, equation, student_answer, work) -> dict | None
             steps = written[1:]
         else:
             steps = []
+    if problem and not is_derivative(problem):
+        problem = with_derivative(problem, [student, *steps])
     if student and not _final_answer(student) and "=" in student and not _algebraic(student):
         return _grade_problem(student, "", [line for line in steps if line != student])
     return _grade_problem(problem, student, steps)

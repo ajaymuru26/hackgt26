@@ -75,6 +75,10 @@ How to pick the mode:
 - A period is a dot on the baseline. Keep it. 3.14 is not 314, and "Yes." keeps the period.
   Words with a ? or a period are a QUESTION, not math and not a drawing.
 - Use * for multiply, / for divide, ^ for powers.
+- d/dx is the derivative with respect to x, not d divided by dx. Write it as d/dx(x^2), d/dt(3t^2),
+  and y=x^2 with dy/dx as d/dx(x^2). Its answer is the derivative, such as "2x". 3/4 is still division.
+- A tall S-shaped sign is an integral. Write it as ∫ with the integrand and dx after it: ∫ x^2 dx.
+  With limits, the lower limit after _ and the upper after ^: ∫_0^1 x^2 dx. It is not a question mark.
 - Handwritten digits are easily mistaken for letters. Assume a character is a DIGIT unless it is
   clearly an algebra variable in an equation: S/s -> 5, Z/z -> 2, l/I/| -> 1, O/o -> 0, g/q -> 9,
   b/G -> 6, B -> 8, T -> 7, t -> +. A letter "x" between two numbers means multiply.
@@ -441,6 +445,17 @@ Read left to right. These are usually digits, not letters: s/S=5, z/Z=2, l/I/|=1
 An x between two numbers means multiply. Use * for multiply, / for divide, and ^ for powers.
 A blank is only an underscore or an empty box. Write it as _. A question mark is not a blank.
 
+Derivatives: d/dx is one operator meaning "the derivative with respect to x". It is not d divided by dx.
+- Write it as d/dx followed by what is differentiated in parentheses: d/dx(x^2), d/dx(x^3+2x).
+  d/dx x^2 and d/dx (x^2) are the same problem. Keep the other letter when it is not x: d/dt(3t^2), d/dy(y^2).
+- d(x^2)/dx is also d/dx(x^2). A second derivative is d^2/dx^2(x^3).
+- dy/dx with y = something written nearby is the derivative of that something: y=x^2 and dy/dx is d/dx(x^2).
+  In their work or answer, a line like dy/dx = 2x stays dy/dx = 2x.
+- A plain fraction such as 3/4 or d/2 is still division. Only d/d followed by a letter is a derivative.
+
+Integrals: a tall S-shaped sign is ∫, not a question mark. Write ∫ x^2 dx, and with limits ∫_0^1 x^2 dx
+(lower limit after _, upper after ^).
+
 Keep every period and every question mark.
 - A period is a dot sitting on the baseline. 3.14 is not 314. "Done." keeps the period.
 - A question mark is a curve with a separate dot underneath. Read both parts as one ?.
@@ -461,6 +476,7 @@ Transcription only. Do not solve. Keep a trailing =. One object per problem, top
 Read their problem, every step, and their final answer exactly, even if it is wrong or unfinished.
 student_answer is null when they did not finish. missing says what they left out, or "" when nothing is missing.
 correct is true, false, or null. correct_answer is the right result, such as 9 or x=2.
+For a derivative, the expression is the d/dx(...) problem and correct_answer is the derivative, such as 2x.
 """
 
 PHOTO_READ = (
@@ -474,6 +490,22 @@ FAST_ACTION = {
     "work": "They pressed Show work. Transcribe math or a pattern and do not compute it. Written words: mode answer.",
     "hint": "They pressed Hint. Respond with mode hint only.",
     "check": "They pressed Check my work. Respond with mode check only. Copy the problem, every step, and their final answer exactly, even if it is wrong or unfinished. Say what is missing.",
+    "submit": """They pressed Submit. Respond with mode check only.
+Copy the problem, every step they wrote, and their final answer exactly, even if it is wrong or unfinished.
+student_answer is null when they did not finish. missing says what they left out, or "" when nothing is missing.
+Add "steps": the correct working, one short line per step, ending with the right answer. Do not copy their wrong steps into steps.
+Add "formula": one relevant formula in plain ASCII, or "" when none is needed.
+In formula and steps, write a square root as sqrt(...) with everything under the root inside the parentheses,
+and plus-minus as +- with a space on each side. The robot draws these as a radical sign and a plus-minus sign.
+Write an integral as ∫ followed by the integrand and dx: ∫ x^2 dx = x^3/3 + C. A definite integral puts the
+lower limit after _ and the upper after ^: ∫_0^1 x^2 dx = 1/3. The robot draws ∫ as an integral sign.
+Plain arithmetic such as 12+7 does not need a formula.
+A quadratic needs: x = (-b +- sqrt(b^2 - 4ac)) / (2a)
+A right triangle needs: a^2 + b^2 = c^2
+A circle's area needs: A = pi*r^2
+A derivative such as d/dx(x^3+2x) needs the power rule: d/dx (x^n) = nx^(n-1). Never the quadratic formula.
+Its steps are one derivative per term, then the whole: d/dx (x^3) = 3x^2, d/dx (2x) = 2, d/dx (x^3+2x) = 3x^2+2.
+Put formula and steps on each problem when there are several.""",
     "recommend": """They pressed Recommended action. Choose the one button that fits, then transcribe the board for that button.
 Pick exactly one recommend value:
 - check: they already wrote an answer or a finished result, even if it is wrong (2+2=5, x=3)
@@ -541,7 +573,7 @@ def read_fast(png_bytes: bytes, strokes=None, action: str = "", image_box=None, 
         user += "\n\n" + PHOTO_READ
     if note and note.strip():
         user += "\n\n" + note.strip()[:800]
-    call = {"max_tokens": 1200 if action in ("check", "recommend") else 700, "mime": "image/jpeg", "detail": "high"}
+    call = {"max_tokens": 1200 if action in ("check", "recommend", "submit") else 700, "mime": "image/jpeg", "detail": "high"}
     if (provider or "openai").lower() not in ("gemini", "claude"):
         call["model"] = OPENAI_MATH_MODEL
     ai = _dispatch([(caption, b64)], user, FAST_PROMPT, provider, **call)

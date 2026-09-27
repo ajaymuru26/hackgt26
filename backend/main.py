@@ -1,5 +1,5 @@
 """
-Whiteboard finisher backend.
+EduSketch backend.
 
 Run:  uvicorn main:app --reload     (from the backend/ folder)
 Then open http://localhost:8000
@@ -35,7 +35,7 @@ import text_writer
 import tracer
 import vision
 
-app = FastAPI(title="Whiteboard Finisher")
+app = FastAPI(title="EduSketch")
 
 Stroke = list[list[float]]
 
@@ -213,7 +213,8 @@ def clean_strokes(raw, w, h) -> list[Stroke]:
             continue  # skip anything malformed
         if len(pts) >= 2:  # (no smoothing: it would round off sharp corners like a roof peak)
             cleaned.append([[round(x, 1), round(y, 1)] for x, y in pts])
-    return cleaned
+    # A drawing has no reading order, so the pen goes to the nearest line next (from the robot's home).
+    return gcode.nearest_first(cleaned, (0.0, float(h)))
 
 
 def _loose_box(box, w, h) -> bool:
@@ -304,7 +305,7 @@ def place_answer(expression, result, bbox, w, h, board, blank_bbox=None, ink=(),
             board.add(got.strokes)
         return got.strokes, f"{got.where}, {got.size:.0f} px tall to match your writing"
 
-    if result["kind"] == "evaluate" and not str(expression).strip().endswith("="):
+    if result["kind"] in ("evaluate", "derivative") and not str(expression).strip().endswith("="):
         text = "=" + text  # person wrote "12+7" with no equals sign
 
     def spots(s, bw, bh):
@@ -335,32 +336,112 @@ def clean_work(text) -> str:
     return "\n".join(lines[:5])
 
 
+def _one_line(text, limit=140) -> str:
+    text = " ".join(str(text or "").split())
+    if text.lower() in ("null", "none", "n/a"):
+        return ""
+    return text[:limit]
+
+
+def solution_text(prob, answer="") -> str:
+    """Correct steps, with a formula on the first lines when the problem needs one,
+    and the answer on the last line."""
+    expr = str(prob.get("expression") or prob.get("equation") or "").strip()
+    expr = math_solver.with_derivative(expr, [prob.get("work"), prob.get("student_answer")])
+    derivative = math_solver.is_derivative(expr)
+    formula = ""
+    steps = ""
+    if expr:
+        try:
+            formula = math_solver.relevant_formula(expr)
+        except Exception:
+            formula = ""
+        try:
+            if math_solver.solve(expr)["kind"] == "check" and not derivative:
+                expr = expr.split("=", 1)[0] + "="
+            steps = math_solver.show_work(expr, limit=6)
+        except Exception:
+            steps = ""
+    if not formula and not derivative:
+        formula = _one_line(prob.get("formula"), 160)
+    if not steps:
+        raw = prob.get("steps")
+        if isinstance(raw, list):
+            raw = "\n".join(str(part) for part in raw)
+        steps = clean_work(raw)
+    parts = [part for part in (formula, steps) if part]
+    return with_final("\n".join(parts), answer)
+
+
 def with_final(work: str, answer: str) -> str:
     answer = str(answer or "").strip()
     if not work:
         return answer
-    if not answer or answer in work:
-        return work
-    return f"{work}\n{answer}"
+    return math_solver.answer_last(work, answer)
 
 
-def write_steps(text, bbox, w, h):
-    """Write every line of working under the problem, shrunk so none are cut off."""
-    x1, _, _, y2 = bbox
-    x = max(10, min(float(x1), w - 40))
-    width = max(w - x - 12, 160)
+RIGHT_MARGIN = 16   # the robot's lines end this far from the right edge of the board
+SHIFT_STEP = 40     # how far the block moves right when the spot under the problem has writing
+
+
+def _left_to_right(text, size, width, gap):
+    """Wrapped lines starting at x=0, with their strokes in the order the pen draws them:
+    the leftmost mark first and the rightmost mark last."""
+    rows = []
+    for i, line in enumerate(text_writer.wrap(text, "print", size, width)):
+        glyphs = text_writer.line_glyphs(line, 0, i * size * gap, size)
+        if glyphs:
+            rows.append([s for g in glyphs for s in g])
+    return rows
+
+
+def write_steps(text, bbox, w, h, board=None):
+    """Write every line of working under the problem, starting at its left edge, shrunk so
+    none are cut off. Lines go top to bottom (the answer is the last one), and each line is
+    written from left to right.
+    With a board, the block moves down, and then right, past anything already written there
+    (like an X), so no line lands on other ink."""
+    y2 = float(bbox[3])
+    right = w - RIGHT_MARGIN
+    x = max(placement.EDGE, min(float(bbox[0]), right - 160))
+    width = right - x
     bottom = h - 8
     gap = text_writer.LINE_GAP
+    size = 28.0
+    while size >= 14:
+        rows = _left_to_right(text, size, width, gap)
+        boxes = [placement.bounds(r) for r in rows]
+        top = y2 + max(size * 0.35, placement.GAP)
+        edge = x
+        while boxes and edge + max(b[2] for b in boxes) <= right:
+            y = top
+            while y + boxes[-1][3] <= bottom:
+                if board is None or not any(board.overlap((b[0] + edge, b[1] + y, b[2] + edge, b[3] + y))
+                                            for b in boxes):
+                    strokes = [s for r in rows for s in placement.shift(r, edge, y)]
+                    side = ("lined up with its left edge" if edge == x
+                            else f"{edge - x:.0f} px right of its left edge, clear of other writing")
+                    return strokes, (f"under the problem, {side}, {len(rows)} line(s) of working "
+                                     f"written left to right, {size:.0f} px tall")
+                y += placement.CELL
+            edge += SHIFT_STEP
+        size *= 0.9
     count = max(len(text_writer.wrap(text, "print", 18, width)), 1)
     size = min(28, max(14, (bottom - 12) / (count * gap)))
     block = size * gap * count
-    under = float(y2) + size * 0.35
+    under = y2 + size * 0.35
     y = under if under + block <= bottom else max(8, bottom - block)
-    strokes, written, dropped = text_writer.text_strokes(
-        text, x, y, size, width, "print", bottom + 4)
-    where = f"under the problem, {written} line(s) of working, {size:.0f} px tall"
-    if dropped:
-        where += f" ({dropped} line(s) didn't fit)"
+    rows = _left_to_right(text, size, width, gap)
+    strokes, written = [], 0
+    for row in rows:
+        placed = placement.shift(row, x, y)
+        if placement.bounds(placed)[3] > bottom + 4:
+            break  # no room left on the board
+        strokes += placed
+        written += 1
+    where = f"under the problem, lined up with its left edge, {written} line(s) of working, {size:.0f} px tall"
+    if written < len(rows):
+        where += f" ({len(rows) - written} line(s) didn't fit)"
     return strokes, where
 
 
@@ -606,6 +687,8 @@ def check_problems(ai) -> list:
         "correct_answer": ai.get("correct_answer"),
         "missing": ai.get("missing"),
         "bbox": ai.get("bbox"),
+        "formula": ai.get("formula"),
+        "steps": ai.get("steps"),
     }]
 
 
@@ -652,6 +735,8 @@ def math_from_ai(prob, expression) -> dict:
 
 
 def math_category(expression, kind) -> tuple[str, str]:
+    if kind == "derivative" or math_solver.is_derivative(expression):
+        return "Calculus", "derivative"
     if kind == "solve":
         body = expression.lower().replace(" ", "")
         if "^2" in body or "**2" in body or "²" in body:
@@ -709,7 +794,7 @@ def robot_summary(strokes, w, h) -> str:
         pos = s[-1]
     travel += math.dist(pos, (0.0, float(h))) * mm
     seconds = ink / 50 + travel / 120 + len(ordered) * 0.3
-    return (f"{len(ordered)} stroke(s), ordered nearest-first to cut travel. About {ink:.0f} mm with the pen down "
+    return (f"{len(ordered)} stroke(s), drawn in order. About {ink:.0f} mm with the pen down "
             f"and {travel:.0f} mm of pen-up travel, roughly {seconds:.0f} s on the real robot.")
 
 
@@ -731,6 +816,10 @@ def _reflected(req: CompleteRequest):
 def _plain(text) -> str:
     """Math symbols as words, so the voice reads the working instead of the signs."""
     t = " ".join(str(text or "").split())
+    # \0 keeps the variable x from being read as "times" below.
+    t = re.sub(r"(?<![A-Za-z])d\s*([A-Za-z])\s*/\s*d\s*([A-Za-z])(?![A-Za-z(])",
+               " the derivative of \\1 with respect to \0\\2 ", t)
+    t = re.sub(r"(?<![A-Za-z])d\s*/\s*d\s*([A-Za-z])", " the derivative with respect to \0\\1 of ", t)
     for src, dst in (
         ("**", " to the power of "),
         ("^", " to the power of "),
@@ -746,7 +835,7 @@ def _plain(text) -> str:
         t = t.replace(src, dst)
     t = re.sub(r"(?<=\w)\s+x\s+(?=\w)", " times ", t, flags=re.I)
     t = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " minus ", t)
-    return re.sub(r"\s+", " ", t).strip(" .")
+    return re.sub(r"\s+", " ", t.replace("\0", "")).strip(" .")
 
 
 def explain_math(expression, answer, work="") -> str:
@@ -950,7 +1039,7 @@ def _complete(req: CompleteRequest):
             suggestion["mode"] = "hint"
             prefetched = suggestion
 
-    fast = req.action in ("answer", "work", "hint", "check")
+    fast = req.action in ("answer", "work", "hint", "check", "submit")
     remembered = student_memory.hint_note() if req.action == "hint" else ""
     if prefetched is None:
         if fast:
@@ -984,11 +1073,11 @@ def _complete(req: CompleteRequest):
             ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
                                       req.image_box, req.provider, note if req.action == "drawing" else "")
     except RuntimeError as e:
-        if req.action == "check":
+        if req.action in ("check", "submit"):
             return unreadable_check("I couldn't read the writing, so nothing is marked wrong.")
         raise HTTPException(500, str(e))
     except Exception as e:
-        if req.action == "check":
+        if req.action in ("check", "submit"):
             return unreadable_check("I couldn't read the writing, so nothing is marked wrong.")
         raise HTTPException(502, f"AI request failed: {e}")
     if looked is not None:
@@ -1002,7 +1091,10 @@ def _complete(req: CompleteRequest):
              "hint": "a hint", "check": "checking work"}
     buttons = {"answer": "Answer", "work": "Answer but show work", "hint": "Hint",
                "check": "Check my work", "drawing": "Finish drawing"}
-    if req.action in ("hint", "check"):
+    if req.action == "submit":
+        step("Decided what to do", "Submit checks the work, writes the steps, and adds a formula when one is needed.")
+        mode = "check"
+    elif req.action in ("hint", "check"):
         step("Decided what to do", f"You pressed {buttons[req.action]}.")
         mode = req.action
     elif req.mode in ("math", "fill", "drawing"):
@@ -1085,7 +1177,7 @@ def _complete(req: CompleteRequest):
                 except Exception:
                     local = ""
                 shown = with_final(local or clean_work(prob.get("work")), result["answer"])
-                new, where = write_steps(shown, bbox, req.width, req.height)
+                new, where = write_steps(shown, bbox, req.width, req.height, board)
                 if new:
                     board.add(new)
                 else:
@@ -1193,6 +1285,21 @@ def _complete(req: CompleteRequest):
         said, notes = [], []
         rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12
+
+        def write_solution(prob, box, answer):
+            """Under the problem: a formula when one applies, the correct steps, and the answer
+            last. Returns the strokes (the caller adds them after the mark) and what to log."""
+            if req.action != "submit":
+                return [], ""
+            block = solution_text(prob, answer)
+            if not block.strip():
+                return [], ""
+            extra, where = write_steps(block, box, req.width, req.height, board)
+            if not extra:
+                return [], block
+            board.add(extra)
+            return extra, f"Wrote it {where}, the answer last:\n{block}"
+
         for n, prob in enumerate(problems, 1):
           try:
             if len(rows) == len(problems):
@@ -1220,12 +1327,24 @@ def _complete(req: CompleteRequest):
             if status == "missing":
                 missing += 1
                 note = str(judged.get("note") or detail or "the answer is missing")
-                notes.append(note)
                 said.append(detail or note)
                 step(label, f"Read\n{shown}\n{detail or note}")
+                solution, wrote = write_solution(prob, (x1, y1, x2, y2), fix if has_fix else "")
+                if wrote:
+                    step("Showed the steps", wrote)
+                if solution:
+                    strokes += solution
+                else:
+                    notes.append(note)
                 continue
 
-            def mark(s, status=status, fix=fix, has_fix=has_fix):
+            # A wrong answer's steps end on the right answer, so the X goes on by itself and the
+            # answer is only written beside it when there are no steps to finish on.
+            solution, wrote = ([], "") if status == "correct" else \
+                write_solution(prob, (x1, y1, x2, y2), fix if has_fix else "")
+            beside = has_fix and not solution
+
+            def mark(s, status=status, fix=fix, has_fix=beside):
                 """A check, or an X with the right answer beside it, drawn at the origin."""
                 if status == "correct":
                     return handwriting.text_to_strokes("✓", 0, 0, s)
@@ -1252,13 +1371,17 @@ def _complete(req: CompleteRequest):
             else:
                 wrong += 1
                 note = str(judged.get("note") or "").strip()
-                if note:
-                    notes.append(note)
                 fact = f"The student wrote {shown} and it was wrong. {detail}"
                 if student_memory.remember(fact):
                     step("Remembered the mistake", "Stored it in Backboard so the next hint can bring it up.")
                 said.append(detail or note or f"{shown} is wrong.")
-                step(label, f"Read\n{shown}\n{detail} Marked it with an X{' and the correct answer' if has_fix else ''}, {got.where}.")
+                step(label, f"Read\n{shown}\n{detail} Marked it with an X{' and the correct answer' if beside else ''}, {got.where}.")
+                if wrote:
+                    step("Showed the steps", wrote)
+                if solution:
+                    strokes += solution
+                elif note:
+                    notes.append(note)
           except Exception:
             missing += 1
             note = "I couldn't check this line, so it is not marked wrong."
@@ -1284,7 +1407,10 @@ def _complete(req: CompleteRequest):
             parts.append(f"{missing} missing")
         summary = ", ".join(parts) if parts else "checked"
         category = {"type": "Check", "detail": summary}
-        identify(category, "You asked to check your work, so each line is marked correct, wrong, or missing.")
+        if req.action == "submit":
+            identify(category, "A correct answer just gets a check. Wrong or unfinished work gets the steps written underneath, with a formula when the problem needs one.")
+        else:
+            identify(category, "You asked to check your work, so each line is marked correct, wrong, or missing.")
         if strokes:
             step("Planned the robot", robot_summary(strokes, req.width, req.height))
         return {"mode": "check", "description": description, "answer": summary,

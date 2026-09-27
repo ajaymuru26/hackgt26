@@ -8,6 +8,8 @@ be animated in the browser or sent to the robot as pen moves.
 """
 import math
 
+from text_writer import plus_minus
+
 Point = tuple[float, float]
 
 
@@ -38,6 +40,7 @@ GLYPHS: dict[str, tuple[float, list[list[Point]]]] = {
     "9": (0.6, [ellipse(0.3, 0.3, 0.3, 0.3), [(0.6, 0.3), (0.42, 1.0)]]),
     "+": (0.6, [[(0.05, 0.5), (0.55, 0.5)], [(0.3, 0.25), (0.3, 0.75)]]),
     "-": (0.6, [[(0.05, 0.5), (0.55, 0.5)]]),
+    "±": (0.6, [[(0.05, 0.42), (0.55, 0.42)], [(0.3, 0.18), (0.3, 0.66)], [(0.05, 0.88), (0.55, 0.88)]]),
     "=": (0.6, [[(0.05, 0.38), (0.55, 0.38)], [(0.05, 0.62), (0.55, 0.62)]]),
     ".": (0.25, [ellipse(0.1, 0.95, 0.04, 0.04, 10)]),
     ",": (0.25, [[(0.12, 0.9), (0.06, 1.12)]]),
@@ -62,6 +65,7 @@ LETTER_SPACING = 0.22  # gap between characters, as a fraction of text height
 
 def text_to_strokes(text: str, x: float, y_top: float, height: float) -> list[list[list[float]]]:
     """Turn text into strokes (lists of [x, y] points) starting at (x, y_top)."""
+    text = plus_minus(text)
     strokes = []
     cursor = x
     for ch in text:
@@ -78,7 +82,7 @@ def text_to_strokes(text: str, x: float, y_top: float, height: float) -> list[li
 
 def text_width(text: str, height: float) -> float:
     total = 0.0
-    for ch in text:
+    for ch in plus_minus(text):
         glyph = GLYPHS.get(ch) or GLYPHS.get(ch.lower())
         total += ((glyph[0] if glyph else 0.5) + LETTER_SPACING) * height
     return total

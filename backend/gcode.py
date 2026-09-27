@@ -13,9 +13,15 @@ PEN_DELAY = "G4 P0.15"  # short pause so the pen finishes moving
 
 
 def order_strokes(strokes):
+    """The strokes the pen draws, in the order given. The backend already put them in order:
+    writing line by line (each line left to right), drawings nearest-first."""
+    return [s for s in strokes if len(s) >= 2]
+
+
+def nearest_first(strokes, start=(0.0, 0.0)):
     """Greedy nearest-neighbour ordering (and flipping) so the pen travels less."""
     remaining = [s for s in strokes if len(s) >= 2]
-    ordered, pos = [], (0.0, 0.0)
+    ordered, pos = [], start
     while remaining:
         best_i, best_d, flip = 0, float("inf"), False
         for i, s in enumerate(remaining):
