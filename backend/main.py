@@ -452,6 +452,61 @@ def stroke_rows(user_strokes, gap=10):
     return rows
 
 
+def _has_variable(text: str) -> bool:
+    """A letter that is still a letter after 3x4 is read as multiply."""
+    cleaned = re.sub(r"(\d)\s*[xX]\s*(\d)", r"\1*\2", text or "")
+    return bool(re.search(r"[A-Za-z]", cleaned))
+
+
+def pick_recommendation(ai: dict) -> tuple[str, str]:
+    """Which of the five buttons fits this board. The read can suggest one; the writing decides."""
+    suggested = str(ai.get("recommend") or "").strip().lower()
+    if suggested not in ("answer", "work", "hint", "check", "drawing"):
+        suggested = ""
+    why = " ".join(str(ai.get("why") or "").split())
+    mode = str(ai.get("mode") or "").strip().lower()
+    problems = [p for p in (ai.get("problems") or []) if isinstance(p, dict)]
+    answered = started = multi = False
+    saw_problem = False
+    for prob in problems:
+        expr = " ".join(str(prob.get("expression") or prob.get("equation") or "").split())
+        work = " ".join(str(prob.get("work") or "").split())
+        student = " ".join(str(prob.get("student_answer") or "").split())
+        if student.lower() in ("null", "none"):
+            student = ""
+        if not expr and not work and not student:
+            continue
+        saw_problem = True
+        if work and work.lower() not in ("null", "none"):
+            started = True
+        if student:
+            answered = True
+        if "=" in expr:
+            left, right = expr.split("=", 1)
+            if right.strip() and right.strip() not in ("_", "?") and not _has_variable(left):
+                answered = True
+        body = expr.split("=", 1)[0]
+        if len(re.findall(r"[+\-*/^]", body)) >= 2 or _has_variable(body):
+            multi = True
+        if re.search(r"\d{2,}\s*[*xX×]\s*\d{2,}", body):
+            multi = True
+    question = " ".join(str(ai.get("question") or "").split())
+    writing = saw_problem or bool(question) or mode in ("math", "fill", "answer", "hint", "check")
+    if (mode == "drawing" or suggested == "drawing") and not writing:
+        return "drawing", why or "It is a picture, so finish the drawing."
+    if answered:
+        return "check", why or "An answer is already written, so check the work."
+    if started:
+        return "hint", why or "The work is started and not finished, so give a hint."
+    if multi:
+        return "work", why or "This needs more than one step, so show the work."
+    if writing or suggested == "answer":
+        return "answer", why or "The problem is ready for an answer."
+    if suggested:
+        return suggested, why or "This is the closest fit for what is on the board."
+    return "drawing", why or "Nothing here reads as a problem, so finish the drawing."
+
+
 def picked_mode(ai, action: str) -> str:
     """What to do with a read. A missing mode is not a drawing, and a question is not a picture."""
     mode = str(ai.get("mode") or "").strip().lower()
@@ -515,23 +570,69 @@ def solved_math(prob, expression) -> dict:
     return result
 
 
-def local_check(prob) -> dict | None:
-    """Mark the student's line with SymPy. None means the transcription could not be checked."""
-    expression = str(prob.get("expression") or "").strip()
-    equation = str(prob.get("equation") or "").strip()
-    student = str(prob.get("student_answer") or "").strip()
-    if student.lower() in ("null", "none"):
-        student = ""
-    if not expression and not equation:
-        return None
-    try:
-        return math_solver.check_work(
-            expression=expression or None,
-            equation=equation or None,
-            student_answer=student or None,
-        )
-    except Exception:
-        return None
+def check_shown(prob) -> str:
+    """The problem, the steps, and the answer, in the order they were written."""
+    parts = []
+    for key in ("expression", "equation", "work", "student_answer"):
+        text = prob.get(key)
+        if isinstance(text, list):
+            text = "\n".join(str(part) for part in text)
+        text = " ".join(str(text or "").split())
+        if text and text.lower() not in ("null", "none") and text not in parts:
+            parts.append(text)
+    return "\n".join(parts) if parts else "(blank)"
+
+
+def check_problems(ai) -> list:
+    """One problem per thing on the board, even when the read is not already a list."""
+    raw = ai.get("problems")
+    if isinstance(raw, dict):
+        raw = [raw]
+    problems = [p for p in (raw or []) if isinstance(p, dict)]
+    if problems:
+        return problems
+    expression = str(ai.get("expression") or ai.get("equation") or "").strip()
+    question = str(ai.get("question") or "").strip()
+    if not expression and any(ch.isdigit() for ch in question):
+        expression = question
+    if not expression:
+        return []
+    return [{
+        "expression": expression,
+        "equation": ai.get("equation"),
+        "work": ai.get("work"),
+        "student_answer": ai.get("student_answer"),
+        "correct": ai.get("correct"),
+        "correct_answer": ai.get("correct_answer"),
+        "missing": ai.get("missing"),
+        "bbox": ai.get("bbox"),
+    }]
+
+
+def model_grade(prob, shown: str) -> dict:
+    """What the read itself says, used when the writing cannot be checked exactly."""
+    correct = prob.get("correct")
+    if isinstance(correct, str):
+        correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
+    if not isinstance(correct, bool):
+        correct = None
+    fix = str(prob.get("correct_answer") or "").strip()
+    if fix.lower() in ("null", "none"):
+        fix = ""
+    missing = " ".join(str(prob.get("missing") or "").split())
+    if missing.lower() in ("null", "none"):
+        missing = ""
+    if correct is True:
+        return {"status": "correct", "correct_answer": fix, "note": "", "missing": "",
+                "detail": f"{shown} is correct."}
+    if correct is False:
+        detail = missing or (f"That is not right. The answer is {fix}." if fix else "That does not check out.")
+        note = missing or (f"not quite. Answer: {fix}" if fix else "that does not check out")
+        return {"status": "wrong", "correct_answer": fix, "note": note[:90], "missing": "", "detail": detail}
+    detail = missing or (f"The answer is missing. It should be {fix}." if fix else
+                         f"I read {shown}. I couldn't check it, so it is not marked wrong.")
+    note = missing or (f"answer is missing. It should be {fix}" if fix else "I couldn't check this line")
+    return {"status": "missing", "correct_answer": fix, "note": note[:90], "missing": detail, "detail": detail}
 
 
 def math_from_ai(prob, expression) -> dict:
@@ -731,6 +832,10 @@ def _with_voice(result: dict) -> dict:
 def complete(req: CompleteRequest):
     started = time.perf_counter()
     result = _complete(req)
+    for item in result.get("steps") or []:
+        if item.get("title") == "Recommended action":
+            result["recommended"] = str(item.get("detail") or "").split(".", 1)[0].strip()
+            break
     boards.remember(result, source="complete", action=req.action, provider=req.provider,
                     user_strokes=req.strokes, seconds=time.perf_counter() - started)
     return _with_voice(result)
@@ -811,29 +916,83 @@ def _complete(req: CompleteRequest):
                 "plan": "Reflect the ink across its right edge, onto the right.",
                 "strokes": strokes, "highlight": highlight, "steps": steps, "category": category}
 
+    prefetched = None
+    if req.action == "recommend":
+        step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)} "
+                                    "to choose among Answer, Show work, Hint, Check, and Finish drawing.")
+        started_rec = time.perf_counter()
+        try:
+            suggestion = vision.read_fast(png, req.strokes, "recommend", req.image_box, req.provider, "")
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"AI request failed: {e}")
+        steps[-1]["detail"] += f" It answered in {time.perf_counter() - started_rec:.1f} s."
+        if not isinstance(suggestion, dict):
+            suggestion = {}
+        chosen, why = pick_recommendation(suggestion)
+        labels = {"answer": "Answer", "work": "Answer but show work", "hint": "Hint",
+                  "check": "Check my work", "drawing": "Finish drawing"}
+        step("Recommended action", f"{labels[chosen]}. {why}")
+        req.action = chosen
+        if chosen in ("answer", "work"):
+            if suggestion.get("problems") or suggestion.get("expression"):
+                suggestion["mode"] = "math"
+            elif str(suggestion.get("text") or "").strip():
+                suggestion["mode"] = "fill"
+            elif str(suggestion.get("question") or suggestion.get("answer") or "").strip():
+                suggestion["mode"] = "answer"
+            prefetched = suggestion
+        elif chosen == "check":
+            suggestion["mode"] = "check"
+            prefetched = suggestion
+        elif chosen == "hint" and str(suggestion.get("hint") or suggestion.get("answer") or "").strip():
+            suggestion["mode"] = "hint"
+            prefetched = suggestion
+
     fast = req.action in ("answer", "work", "hint", "check")
     remembered = student_memory.hint_note() if req.action == "hint" else ""
-    if fast:
-        step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)}. "
-                                    "The model only reads the handwriting. Math is solved on this computer.")
+    if prefetched is None:
+        if fast:
+            step("Looked at the board", f"Sent one close-up of {what} to {vision.fast_provider_name(req.provider)}. "
+                                        "The model only reads the handwriting. Math is solved on this computer.")
+        else:
+            step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
+                                        f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
+        looked = steps[-1]
     else:
-        step("Looked at the board", f"Sent a picture of {what} with a coordinate grid "
-                                    f"and each stroke's exact points to {vision.provider_name(req.provider)}.")
-    looked = steps[-1]
+        looked = None
     if req.action == "drawing" and note:
         step("Your instruction", f"\"{note}\"")
+    def unreadable_check(message):
+        """Check my work always answers. A failed read is a sentence on the board, not an error."""
+        step("Checked the writing", message)
+        strokes, _, _, where = write_below(message, layout, req.width, req.height, board)
+        if strokes:
+            step("Wrote the result", f"{message} {where}.")
+        category = {"type": "Check", "detail": message}
+        return {"mode": "check", "description": message, "answer": message, "say": message,
+                "strokes": strokes, "steps": steps, "category": category}
+
     started = time.perf_counter()
     try:
-        if fast:
+        if prefetched is not None:
+            ai = prefetched
+        elif fast:
             ai = vision.read_fast(png, req.strokes, req.action, req.image_box, req.provider, remembered)
         else:
             ai = vision.analyze_board(png, shapes.summarize_strokes(req.strokes), req.strokes, req.mode, req.action,
                                       req.image_box, req.provider, note if req.action == "drawing" else "")
     except RuntimeError as e:
+        if req.action == "check":
+            return unreadable_check("I couldn't read the writing, so nothing is marked wrong.")
         raise HTTPException(500, str(e))
     except Exception as e:
+        if req.action == "check":
+            return unreadable_check("I couldn't read the writing, so nothing is marked wrong.")
         raise HTTPException(502, f"AI request failed: {e}")
-    looked["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
+    if looked is not None:
+        looked["detail"] += f" It answered in {time.perf_counter() - started:.1f} s."
     if remembered:
         step("Remembered this student", remembered)
 
@@ -1025,41 +1184,50 @@ def _complete(req: CompleteRequest):
                 "strokes": strokes, "steps": steps, "category": category}
 
     if mode == "check":
-        step("AI's notes", ai.get("reasoning"))
-        problems = [p for p in (ai.get("problems") or []) if isinstance(p, dict)]
+        step("AI's notes", ai.get("reasoning") if isinstance(ai, dict) else "")
+        problems = check_problems(ai if isinstance(ai, dict) else {})
         if not problems:
-            raise HTTPException(422, "I couldn't find any problems with answers to check.")
+            return unreadable_check("I couldn't find a problem to check. Write the problem and your work, and I'll say if it's right, wrong, or what's missing.")
         everything = content_bbox(layout) or (40, 40, req.width - 40, 120)
-        strokes, right, wrong, empty = [], 0, 0, 0
+        strokes, right, wrong, missing = [], 0, 0, 0
         said, notes = [], []
         rows = stroke_rows(req.strokes) if req.strokes else []
         pad = 30 if len(problems) == 1 else 12
         for n, prob in enumerate(problems, 1):
+          try:
             if len(rows) == len(problems):
                 prob["bbox"] = rows[n - 1]
-            label = f"Problem {n}" if len(problems) > 1 else "Your problem"
-            shown = prob.get("expression") or f"{prob.get('equation')}  ->  {prob.get('student_answer') or '(no answer)'}"
-            judged = local_check(prob)
-            if judged:
-                correct, fix = judged["correct"], str(judged.get("correct_answer") or "").strip()
-            else:
-                correct = prob.get("correct")
-                if isinstance(correct, str):
-                    correct = {"true": True, "yes": True, "false": False, "no": False}.get(correct.strip().lower())
-                if correct is None and str(prob.get("correct") or "").strip().lower() in ("null", "none", ""):
-                    correct = None
-                fix = str(prob.get("correct_answer") or "").strip()
+            label = f"Problem {n}" if len(problems) > 1 else "Your work"
+            shown = check_shown(prob)
+            try:
+                judged = math_solver.grade_submission(
+                    expression=prob.get("expression"),
+                    equation=prob.get("equation"),
+                    student_answer=prob.get("student_answer"),
+                    work=prob.get("work"),
+                )
+            except Exception:
+                judged = None
+            if not judged:
+                judged = model_grade(prob, shown)
+            status = judged.get("status") or "missing"
+            fix = str(judged.get("correct_answer") or "").strip()
             x1, y1, x2, y2 = refine_bbox(prob.get("bbox") or everything, req.strokes, pad)
             size = min(max((y2 - y1) * 0.85, 28), 120)
-            if correct is None:
-                empty += 1
-                step(label, f"Read  {shown}  but there's no answer written yet, so nothing to mark.")
-                continue
             has_fix = bool(fix) and fix.lower() not in ("null", "none")
+            detail = str(judged.get("detail") or "").strip()
 
-            def mark(s, correct=correct, fix=fix, has_fix=has_fix):
+            if status == "missing":
+                missing += 1
+                note = str(judged.get("note") or detail or "the answer is missing")
+                notes.append(note)
+                said.append(detail or note)
+                step(label, f"Read\n{shown}\n{detail or note}")
+                continue
+
+            def mark(s, status=status, fix=fix, has_fix=has_fix):
                 """A check, or an X with the right answer beside it, drawn at the origin."""
-                if correct:
+                if status == "correct":
                     return handwriting.text_to_strokes("✓", 0, 0, s)
                 cross = handwriting.text_to_strokes("✗", 0, 0, s)
                 if not has_fix:
@@ -1077,35 +1245,49 @@ def _complete(req: CompleteRequest):
             got = placement.place(board, mark, mark_spots, placement.shrinking(size, steps=3, factor=0.8),
                                   spot_first=True)
             strokes += got.strokes
-            if correct:
+            if status == "correct":
                 right += 1
-                said.append(f"{shown} is correct.")
-                step(label, f"Read  {shown}  and checked it here: correct. Marked it with a check {got.where}.")
+                said.append(detail or f"{shown} is correct.")
+                step(label, f"Read\n{shown}\nCorrect. Marked it with a check {got.where}.")
             else:
                 wrong += 1
-                bug = math_solver.explain_mistake(
-                    expression=str(prob.get("expression") or "").strip() or None,
-                    equation=str(prob.get("equation") or "").strip() or None,
-                    student_answer=str(prob.get("student_answer") or "").strip() or None,
-                    correct_answer=fix,
-                )
-                notes.append(bug["note"])
-                fact = f"The student wrote {shown} and it was wrong. {bug['detail']}"
+                note = str(judged.get("note") or "").strip()
+                if note:
+                    notes.append(note)
+                fact = f"The student wrote {shown} and it was wrong. {detail}"
                 if student_memory.remember(fact):
                     step("Remembered the mistake", "Stored it in Backboard so the next hint can bring it up.")
-                step(label, f"{bug['detail']} Marked it with an X{' and the correct answer' if has_fix else ''}, {got.where}.")
-                said.append(bug["detail"])
-        total = right + wrong
-        if not total:
-            raise HTTPException(422, "I didn't find any finished answers to check. Write your answer after the = sign.")
+                said.append(detail or note or f"{shown} is wrong.")
+                step(label, f"Read\n{shown}\n{detail} Marked it with an X{' and the correct answer' if has_fix else ''}, {got.where}.")
+          except Exception:
+            missing += 1
+            note = "I couldn't check this line, so it is not marked wrong."
+            notes.append(note)
+            said.append(note)
+            step(f"Problem {n}" if len(problems) > 1 else "Your work", note)
         if notes:
-            extra, _, _, where = write_below("\n".join(notes), layout, req.width, req.height, board)
-            strokes += extra
-            step("Pointed out the error", f"Wrote the mistake {where}:\n" + "\n".join(notes))
-        category = {"type": "Check", "detail": f"{right} of {total} correct" + (f", {empty} not answered yet" if empty else "")}
-        identify(category, "You asked to check your work, so each wrong answer gets the mistake and how to fix it.")
-        step("Planned the robot", robot_summary(strokes, req.width, req.height))
-        return {"mode": "check", "description": description, "answer": category["detail"],
+            try:
+                extra, _, _, where = write_below("\n".join(notes), layout, req.width, req.height, board)
+                strokes += extra
+                step("Wrote what to fix", f"Wrote it {where}:\n" + "\n".join(notes))
+            except Exception:
+                step("Wrote what to fix", "\n".join(notes))
+        if not strokes and not said:
+            return unreadable_check("I read the board, but I couldn't check that writing. Nothing is marked wrong.")
+        parts = []
+        total = right + wrong + missing
+        if total:
+            parts.append(f"{right} of {total} correct")
+        if wrong:
+            parts.append(f"{wrong} wrong")
+        if missing:
+            parts.append(f"{missing} missing")
+        summary = ", ".join(parts) if parts else "checked"
+        category = {"type": "Check", "detail": summary}
+        identify(category, "You asked to check your work, so each line is marked correct, wrong, or missing.")
+        if strokes:
+            step("Planned the robot", robot_summary(strokes, req.width, req.height))
+        return {"mode": "check", "description": description, "answer": summary,
                 "say": " ".join(said)[:800], "strokes": strokes,
                 "steps": steps, "category": category}
 

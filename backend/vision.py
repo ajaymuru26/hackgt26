@@ -418,18 +418,20 @@ For a pattern, "work" is one line naming the rule, and "text" is still what to w
 {"mode": "hint", "description": "what is on the board", "reasoning": "what the next step is and why",
  "hint": "ONE short hint, max 15 words, that helps them take the next step without giving away the answer"}
 This works for maths, questions, patterns and drawings (e.g. "What do houses have on top?").""",
-    "check": """The person pressed CHECK MY WORK: they wrote problems AND their own answers. Respond with:
+    "check": """The person pressed CHECK MY WORK. Read THEIR problem, THEIR steps, and THEIR answer. Respond with:
 {"mode": "check", "description": "what is on the board", "reasoning": "anything you were unsure reading",
  "problems": [
-   {"expression": "5+4=10", "bbox": [x1, y1, x2, y2]},
-   {"equation": "2*x+3=7", "student_answer": "x=3", "bbox": [x1, y1, x2, y2]}
+   {"expression": "5+4=", "work": "5+4=10", "student_answer": "10",
+    "correct": false, "correct_answer": "9", "missing": "", "bbox": [x1, y1, x2, y2]},
+   {"equation": "2*x+3=7", "work": "2*x=4", "student_answer": null,
+    "correct": null, "correct_answer": "x=2", "missing": "They stopped before dividing by 2.",
+    "bbox": [x1, y1, x2, y2]}
  ]}
-- Arithmetic: "expression" is the whole line exactly as written, INCLUDING the student's answer.
-- Algebra: "equation" is the equation, "student_answer" is what they wrote as the solution (or null).
-- TRANSCRIBE EXACTLY what they wrote, even if it is wrong. Then YOU check it.
-  Add "correct": true, false, or null if they wrote no answer yet, and "correct_answer": the right result
-  as you compute it (e.g. "9" or "x=2").
-- "bbox" covers the problem and the student's answer. One entry per problem, top to bottom.""",
+- Copy every line they wrote, even when it is wrong or unfinished. Never replace their work with the right work.
+- "expression" or "equation" is the problem. "work" is their steps, one per line. "student_answer" is only their final result, or null if they did not finish.
+- "correct" is true, false, or null when no final answer is there. "correct_answer" is the right result.
+- "missing" says what they left out. Leave it empty when the work is complete.
+- "bbox" covers that problem and the work under it. One entry per problem, top to bottom.""",
 }
 
 
@@ -455,10 +457,11 @@ Transcription only. Do not solve. Keep a trailing =. One object per problem, top
 
 {"mode":"hint","description":"short","hint":"one nudge, max 12 words, no final answer","reasoning":"one sentence"}
 
-{"mode":"check","description":"short","problems":[{"expression":"5+4=10"}]}
-Arithmetic: expression is the whole line, including their answer, even if it is wrong.
-Algebra: {"equation":"2*x+3=7","student_answer":"x=3"} and student_answer is null if they wrote no solution.
-Do not say whether it is correct."""
+{"mode":"check","description":"short","problems":[{"expression":"5+4=","work":"5+4=10","student_answer":"10","correct":false,"correct_answer":"9","missing":""}]}
+Read their problem, every step, and their final answer exactly, even if it is wrong or unfinished.
+student_answer is null when they did not finish. missing says what they left out, or "" when nothing is missing.
+correct is true, false, or null. correct_answer is the right result, such as 9 or x=2.
+"""
 
 PHOTO_READ = (
     "This is a photo of a whiteboard, not a picture to finish. Read the handwriting. "
@@ -470,7 +473,17 @@ FAST_ACTION = {
               "Written words, including any . or ?: mode answer. Never mode drawing.",
     "work": "They pressed Show work. Transcribe math or a pattern and do not compute it. Written words: mode answer.",
     "hint": "They pressed Hint. Respond with mode hint only.",
-    "check": "They pressed Check my work. Respond with mode check only. Copy their answer exactly, even if it is wrong.",
+    "check": "They pressed Check my work. Respond with mode check only. Copy the problem, every step, and their final answer exactly, even if it is wrong or unfinished. Say what is missing.",
+    "recommend": """They pressed Recommended action. Choose the one button that fits, then transcribe the board for that button.
+Pick exactly one recommend value:
+- check: they already wrote an answer or a finished result, even if it is wrong (2+2=5, x=3)
+- hint: they started steps and stopped before a final answer
+- work: the problem needs more than one step and they have not started (algebra, several operations, a long multiply)
+- answer: a short unfinished problem, a pattern, or a written question
+- drawing: a picture, not writing. Mode drawing is allowed here.
+Reply with {"recommend":"check","why":"one short sentence","mode":"check", ...the fields that mode needs}.
+For math, always include problems with expression, work, and student_answer copied exactly. student_answer is null if they did not finish.
+For a question, include question and a short answer. For a hint, include hint. For a picture, mode drawing and a short description only.""",
 }
 
 
@@ -528,7 +541,7 @@ def read_fast(png_bytes: bytes, strokes=None, action: str = "", image_box=None, 
         user += "\n\n" + PHOTO_READ
     if note and note.strip():
         user += "\n\n" + note.strip()[:800]
-    call = {"max_tokens": 700, "mime": "image/jpeg", "detail": "high"}
+    call = {"max_tokens": 1200 if action in ("check", "recommend") else 700, "mime": "image/jpeg", "detail": "high"}
     if (provider or "openai").lower() not in ("gemini", "claude"):
         call["model"] = OPENAI_MATH_MODEL
     ai = _dispatch([(caption, b64)], user, FAST_PROMPT, provider, **call)

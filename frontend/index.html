@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=10">
+  <link rel="stylesheet" href="style.css?v=11">
 </head>
 <body>
   <main class="wall">
@@ -82,6 +82,9 @@
       </label>
 
       <div class="action-group" role="group" aria-label="What should the robot do">
+        <button class="action recommend" data-action="recommend" title="Look at the board and press the action that fits: answer, show work, hint, check, or finish the drawing">
+          <span class="action-label">Recommended action</span>
+        </button>
         <button class="action finish" data-action="answer" title="Solve the maths, answer the question, or continue the pattern">
           <span class="cap cap-blue" aria-hidden="true"></span><span class="action-label">Answer</span>
         </button>
@@ -177,6 +180,6 @@
     </div>
     </div>
   </main>
-  <script src="app.js?v=10"></script>
+  <script src="app.js?v=11"></script>
 </body>
 </html>

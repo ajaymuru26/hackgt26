@@ -263,6 +263,7 @@ async function showThoughts(steps) {
 const ACTION_WORDS = { answer: "Working out the answer", work: "Working out the steps",
                        hint: "Thinking of a hint",
                        check: "Checking your work", drawing: "Looking at your drawing",
+                       recommend: "Choosing the action that fits",
                        cv: "Reading the ink with computer vision",
                        auto: "Reading the picture" };
 
@@ -309,7 +310,7 @@ async function runAction(action, button, opts = {}) {
       body: JSON.stringify({ image, width: W, height: H, action, review: opts.instant ? false : $("reviewToggle").checked,
                              image_box: background ? imageBox() : null,
                              strokes: strokes.map((s) => s.points), provider,
-                             instruction: action === "drawing" ? $("drawingNote").value.trim() : "" }),
+                             instruction: action === "drawing" || action === "recommend" ? $("drawingNote").value.trim() : "" }),
     });
     const data = await res.json().catch(() => ({}));
     clearInterval(ticker);
@@ -319,6 +320,7 @@ async function runAction(action, button, opts = {}) {
     const runtime = ((performance.now() - t0) / 1000).toFixed(1);
     showProblemType(data.category);
 
+    const recommended = data.recommended ? `Recommended: ${data.recommended}. ` : "";
     const label = {
       math: `Read ${data.expression} and wrote ${data.answer}`,
       fill: `${data.description || "Next up"}: wrote ${data.answer}`,
@@ -338,12 +340,12 @@ async function runAction(action, button, opts = {}) {
       noteSaved(data);
       showTranscript(data.transcript);
       playSpeech(data.speech);
-      setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
+      setStatus(`${recommended}${label}${checkNote} · ${runtime} s`, "robot");
       await animateRobot(data.strokes, { ink: false, record: false });
       return;
     }
     await showThoughts(data.steps);
-    setStatus(`${label}${checkNote} · ${runtime} s`, "robot");
+    setStatus(`${recommended}${label}${checkNote} · ${runtime} s`, "robot");
     addThought("Runtime", `${runtime} s until writing`);
     noteSaved(data);
     showTranscript(data.transcript);
@@ -356,7 +358,7 @@ async function runAction(action, button, opts = {}) {
     drawing.querySelector(".thought-title").textContent = "Done";
     drawing.querySelector(".thought-detail").textContent = "Finished. Press Replay to watch again.";
     const finished = data.mode !== "drawing" ? label : `Finished ${data.description || "the drawing"}`;
-    setStatus(`${finished}${checkNote} · ${runtime} s`, "robot");
+    setStatus(`${recommended}${finished}${checkNote} · ${runtime} s`, "robot");
   } catch (err) {
     clearInterval(ticker);
     live.remove();

@@ -636,6 +636,14 @@ select:focus-visible {
   box-shadow: none;
 }
 
+.recommend {
+  background: #0c5a44;
+  border-color: #0c5a44;
+  color: #fff;
+}
+
+.recommend:hover:not(:disabled) { background: #094a38; }
+
 .finish {
   background: var(--marker-blue);
   border-color: var(--marker-blue);

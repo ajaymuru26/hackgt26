@@ -116,14 +116,17 @@ def solve(expression: str) -> dict:
     return {"kind": "evaluate", "answer": format_number(sp.simplify(value))}
 
 
-def show_work(expression: str) -> str:
-    """A few plain lines of working for the robot to write under the problem."""
+def show_work(expression: str, limit: int | None = 5) -> str:
+    """Plain lines of working for the robot to write under the problem.
+
+    limit is how many arithmetic lines to keep. None keeps every step.
+    """
     result = solve(expression)
     expr = _clean(expression).rstrip("=").strip()
     if result["kind"] == "evaluate":
-        return _arithmetic_steps(expr, result["answer"])
+        return _arithmetic_steps(expr, result["answer"], limit)
     if result["kind"] == "solve":
-        return _algebra_steps(expr, result["answer"])
+        return _algebra_steps(expr, result["answer"], limit)
     if result["kind"] == "blank":
         return f"the blank is {result['answer']}"
     return result["answer"]
@@ -162,7 +165,7 @@ def _long_multiply(a: int, b: int) -> list[str]:
     return lines
 
 
-def _arithmetic_steps(expr: str, answer: str) -> str:
+def _arithmetic_steps(expr: str, answer: str, limit: int | None = 5) -> str:
     compact = expr.replace(" ", "")
     product = re.fullmatch(r"(\d+)\*(\d+)", compact)
     if product:
@@ -180,7 +183,7 @@ def _arithmetic_steps(expr: str, answer: str) -> str:
         acc = sp.simplify(_parse(f"({format_number(acc)}){op}({nxt})"))
         lines.append(f"{lines and lines[-1].split('=')[-1].strip() or format_number(_parse(parts[0]))} {op} {nxt.replace(' ', '')} = {format_number(acc)}")
         i += 2
-        if len(lines) == 5:
+        if limit is not None and len(lines) == limit:
             break
     if not lines:
         return f"{expr} = {answer}"
@@ -189,7 +192,7 @@ def _arithmetic_steps(expr: str, answer: str) -> str:
     return "\n".join(lines)
 
 
-def _algebra_steps(expr: str, answer: str) -> str:
+def _algebra_steps(expr: str, answer: str, limit: int | None = 5) -> str:
     if "=" in expr and expr.split("=", 1)[1].strip():
         lhs_text, rhs_text = expr.split("=", 1)
         diff = sp.expand(_parse(lhs_text) - _parse(rhs_text))
@@ -216,7 +219,9 @@ def _algebra_steps(expr: str, answer: str) -> str:
         if factored != diff:
             lines.append(f"{factored} = 0".replace("**", "^").replace("*", ""))
     lines.append(answer)
-    return "\n".join(lines[:5])
+    if limit is None:
+        return "\n".join(lines)
+    return "\n".join(lines[:limit])
 
 
 def _coeff_term(coeff, name: str) -> str:
@@ -300,6 +305,350 @@ def check_work(expression: str = None, equation: str = None, student_answer: str
     if lhs.free_symbols or rhs.free_symbols:  # it's an equation with no answer written
         return {"correct": None, "correct_answer": solve(expression)["answer"]}
     return {"correct": sp.simplify(lhs - rhs) == 0, "correct_answer": format_number(sp.simplify(lhs))}
+
+
+def grade_submission(expression: str = None, equation: str = None,
+                     student_answer: str = None, work: str = None) -> dict | None:
+    """Read the problem, the steps, and the answer they wrote.
+
+    status is "correct", "wrong", or "missing". None means the line could not be checked.
+    This never raises.
+    """
+    try:
+        return _grade_submission(expression, equation, student_answer, work)
+    except Exception:
+        return None
+
+
+def _blank(text) -> str:
+    text = " ".join(str(text or "").split())
+    return "" if text.lower() in ("null", "none") else text
+
+
+def _chunks(text) -> list[str]:
+    if isinstance(text, list):
+        text = "\n".join(str(part) for part in text)
+    return [line for line in (_blank(part) for part in re.split(r"[\n;]+", str(text or ""))) if line]
+
+
+def _final_answer(line: str) -> str:
+    """A finished result such as 9 or x=2, not another line of working."""
+    text = _clean(line).replace(" ", "")
+    if re.fullmatch(r"-?\d+(?:\.\d+)?(?:/\d+)?", text):
+        return line.strip()
+    match = re.fullmatch(r"([A-Za-z])=(.+)", text)
+    if not match:
+        return ""
+    rhs = re.split(r"or", match.group(2))[0]
+    if re.fullmatch(r"-?\d+(?:\.\d+)?(?:/\d+)?", rhs):
+        return line.strip()
+    return ""
+
+
+def _algebraic(text: str) -> bool:
+    try:
+        body = _clean(text)
+        if "=" in body:
+            left, right = body.split("=", 1)
+            return bool((_parse(left).free_symbols if left.strip() else set())
+                        or (_parse(right).free_symbols if right.strip() else set()))
+        return bool(_parse(body.rstrip("=")).free_symbols)
+    except Exception:
+        return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def _safe_solve(text: str):
+    text = _blank(text)
+    if not text:
+        return None
+    try:
+        return solve(text)
+    except Exception:
+        return None
+
+
+def _answers_match(student: str, correct_answer: str) -> bool:
+    got, expected = _values(student), _values(correct_answer)
+    if got and expected:
+        if len(got) != len(expected):
+            return False
+        used = [False] * len(expected)
+        for item in got:
+            hit = False
+            for i, target in enumerate(expected):
+                if not used[i] and sp.simplify(item - target) == 0:
+                    used[i] = True
+                    hit = True
+                    break
+            if not hit:
+                return False
+        return True
+    left = re.sub(r"\s+", "", str(student).lower())
+    right = re.sub(r"\s+", "", str(correct_answer).lower())
+    return bool(left) and left == right
+
+
+def _assignment(correct_answer: str) -> dict:
+    subs = {}
+    for piece in re.split(r"\bor\b|,", _clean(str(correct_answer or ""))):
+        match = re.match(r"\s*([A-Za-z])\s*=\s*(.+)", piece)
+        if not match:
+            continue
+        try:
+            subs[sp.Symbol(match.group(1))] = _parse(match.group(2))
+        except Exception:
+            continue
+    return subs
+
+
+def _step_holds(step: str, subs: dict):
+    """True when a written step is true, False when it is not, None when it is not an equation."""
+    if "=" not in step:
+        return None
+    left, right = _clean(step).split("=", 1)
+    if not right.strip():
+        return None
+    diff = sp.simplify(_parse(left) - _parse(right))
+    if subs:
+        diff = sp.simplify(diff.subs(subs))
+    if diff.free_symbols:
+        return None
+    return bool(sp.simplify(diff) == 0)
+
+
+def _bad_step(steps, correct_answer: str) -> str:
+    subs = _assignment(correct_answer)
+    for step in steps:
+        try:
+            holds = _step_holds(step, subs)
+        except Exception:
+            continue
+        if holds is False:
+            return step
+    return ""
+
+
+def _pack_grade(status: str, correct_answer: str, note: str, detail: str, missing: str = "") -> dict:
+    return {
+        "status": status,
+        "correct_answer": correct_answer,
+        "missing": missing,
+        "note": " ".join(note.split())[:90],
+        "detail": " ".join(detail.split()),
+    }
+
+
+def _wrong_step(step: str, correct_answer: str, finished: bool) -> dict:
+    if finished:
+        return _pack_grade(
+            "wrong", correct_answer,
+            f"this step is wrong: {step}",
+            f"The answer {correct_answer} is right, but this step is not: {step}.",
+        )
+    return _pack_grade(
+        "wrong", correct_answer,
+        f"that step is wrong. Answer: {correct_answer}",
+        f"You wrote {step}, and that does not follow. The answer is {correct_answer}.",
+    )
+
+
+def _missing_answer(problem: str, steps, correct_answer: str) -> dict:
+    if steps:
+        last = steps[-1]
+        detail = f"You got as far as {last}. The answer {correct_answer} is still missing."
+        note = f"stopped at {last}. Still missing {correct_answer}"
+    else:
+        detail = f"The answer is missing. {problem} should be {correct_answer}."
+        note = f"answer is missing. It should be {correct_answer}"
+    return _pack_grade("missing", correct_answer, note, detail, detail)
+
+
+def _from_verdict(problem: str, steps, judged: dict) -> dict:
+    answer = str(judged.get("correct_answer") or "")
+    bad = _bad_step(steps, answer) if answer and answer not in ("✓", "✗") else ""
+    if judged.get("correct") and bad:
+        return _wrong_step(bad, answer, True)
+    if judged.get("correct"):
+        return _pack_grade("correct", answer, "", f"{problem} is correct.")
+    bug = explain_mistake(expression=problem, student_answer=None, correct_answer=answer)
+    return _pack_grade("wrong", answer, bug["note"], bug["detail"])
+
+
+def _precedence_lines(expr: str) -> list[str]:
+    """Multiply and divide first, then add and subtract, one line per step."""
+    tokens = re.findall(r"\d+(?:\.\d+)?|[+\-*/^]", expr.replace("**", "^").replace(" ", ""))
+    if len(tokens) < 3 or not tokens[0][:1].isdigit():
+        return []
+
+    def reduce(ops):
+        lines = []
+        i = 1
+        while i < len(tokens) - 1:
+            if tokens[i] in ops and tokens[i - 1][:1].isdigit() and tokens[i + 1][:1].isdigit():
+                left, op, right = tokens[i - 1], tokens[i], tokens[i + 1]
+                value = format_number(sp.simplify(_parse(f"({left}){op}({right})")))
+                lines.append(f"{left} {op} {right} = {value}")
+                tokens[i - 1:i + 2] = [value]
+                i = 1
+            else:
+                i += 2
+        return lines
+
+    steps = reduce("*/^") + reduce("+-")
+    return steps
+
+
+def _worked_lines(problem: str) -> list[str]:
+    """Every correct step. A finished wrong line like 2+2=5 is worked from the left side."""
+    text = _blank(problem)
+    if not text:
+        return []
+    target = text
+    if not _algebraic(text) and "=" in _clean(text):
+        left = _clean(text).split("=", 1)[0].strip()
+        if left:
+            target = left
+    if not _algebraic(target):
+        compact = target.replace(" ", "")
+        product = re.fullmatch(r"(\d+)\*(\d+)", compact)
+        if product and (len(product.group(1)) > 1 or len(product.group(2)) > 1):
+            return _long_multiply(int(product.group(1)), int(product.group(2)))
+        steps = _precedence_lines(target)
+        if steps:
+            return steps
+    try:
+        worked = show_work(target, limit=None)
+    except Exception:
+        return []
+    lines = []
+    for line in worked.splitlines():
+        line = " ".join(line.split())
+        if line and line not in ("✓", "✗"):
+            lines.append(line)
+    return lines
+
+
+def _attach_work(grade, problem: str):
+    """The board and the voice get the steps, not a one-line 'too high' or 'too low'."""
+    if not grade or grade.get("status") == "correct":
+        return grade
+    lines = _worked_lines(problem)
+    if not lines:
+        return grade
+    grade["note"] = "\n".join(lines)
+    grade["detail"] = ". ".join(lines) + "."
+    return grade
+
+
+def _grade_problem(problem: str, student: str, steps) -> dict | None:
+    problem, student = _blank(problem), _blank(student)
+    steps = [step for step in steps if _blank(step) and step not in (problem, student)]
+
+    def finish(grade):
+        return _attach_work(grade, problem)
+
+    if not problem and not student:
+        return None
+
+    if problem and not student:
+        try:
+            judged = check_work(expression=problem)
+        except Exception:
+            judged = None
+        if judged and judged.get("correct") is not None and not _algebraic(problem):
+            return finish(_from_verdict(problem, steps, judged))
+
+    if not student:
+        for i in range(len(steps) - 1, -1, -1):
+            found = _final_answer(steps[i])
+            if found:
+                student = found
+                del steps[i]
+                break
+
+    if not student:
+        for step in reversed(steps):
+            if "=" not in step:
+                continue
+            try:
+                claimed = check_work(expression=step)
+            except Exception:
+                continue
+            if claimed and claimed.get("correct") is not None:
+                earlier = [item for item in steps if item != step]
+                return finish(_from_verdict(step, earlier, claimed))
+
+    solved = _safe_solve(problem) if problem else None
+    if solved and solved.get("kind") == "check":
+        try:
+            judged = check_work(expression=problem, equation=problem if _algebraic(problem) else None,
+                                student_answer=student or None)
+        except Exception:
+            judged = None
+        if judged and judged.get("correct") is not None:
+            return finish(_from_verdict(problem, steps, judged))
+        if judged and not student:
+            solved = {"kind": "missing", "answer": judged.get("correct_answer") or ""}
+        else:
+            solved = _safe_solve(problem.split("=", 1)[0]) if "=" in problem else None
+
+    answer = str((solved or {}).get("answer") or "")
+    if not answer:
+        return None
+    bad = _bad_step(steps, answer)
+    if not student:
+        if bad:
+            return finish(_wrong_step(bad, answer, False))
+        return finish(_missing_answer(problem, steps, answer))
+    if _answers_match(student, answer) and bad:
+        return finish(_wrong_step(bad, answer, True))
+    if _answers_match(student, answer):
+        return _pack_grade("correct", answer, "", f"{problem} = {student} is correct.")
+    claim = problem if "=" in problem and problem.split("=", 1)[1].strip() and not _algebraic(problem) else ""
+    bug = explain_mistake(
+        expression=claim or (None if _algebraic(problem) else f"{problem.split('=', 1)[0].strip()}={student}"),
+        equation=problem if _algebraic(problem) else None,
+        student_answer=student,
+        correct_answer=answer,
+    )
+    return finish(_pack_grade("wrong", answer, bug["note"], bug["detail"]))
+
+
+def _grade_submission(expression, equation, student_answer, work) -> dict | None:
+    student = _blank(student_answer)
+    problem = _blank(equation)
+    steps = [line for line in _chunks(work) if line != student]
+    lines = _chunks(expression)
+
+    if not problem and len(lines) == 1 and not student and not steps:
+        return _grade_problem(lines[0], "", [])
+
+    if not problem:
+        pool = list(lines)
+        if not student and len(pool) >= 2 and _final_answer(pool[-1]):
+            student = pool[-1]
+            pool = pool[:-1]
+        if pool:
+            problem = pool[0]
+            steps = pool[1:] + [line for line in steps if line not in pool[1:] and line not in (student, problem)]
+    else:
+        steps = [line for line in lines + steps if line not in (problem, student)]
+
+    if not problem and steps:
+        written = list(steps)
+        if len(written) == 1 and not student:
+            return _grade_problem(written[0], "", [])
+        if not student and _final_answer(written[-1]):
+            student = written[-1]
+            written = written[:-1]
+        if written:
+            problem = written[0]
+            steps = written[1:]
+        else:
+            steps = []
+    if student and not _final_answer(student) and "=" in student and not _algebraic(student):
+        return _grade_problem(student, "", [line for line in steps if line != student])
+    return _grade_problem(problem, student, steps)
 
 
 _OP_WORD = {"+": "plus", "-": "minus", "*": "times", "/": "divided by", "^": "to the power of"}
@@ -474,7 +823,8 @@ def _explain_algebra(equation, student_answer, correct_answer):
         worked = ""
     copied = re.findall(r"-?\d+(?:\.\d+)?", student)
     in_problem = set(re.findall(r"\d+(?:\.\d+)?", equation.split("=")[0]))
-    if copied and copied[-1].lstrip("-") in in_problem and answer and copied[-1] not in answer:
+    bare_number = not re.search(r"[A-Za-z]", student)
+    if bare_number and copied and copied[-1].lstrip("-") in in_problem and answer and copied[-1] not in answer:
         detail = (f"You wrote {student}, but {copied[-1]} is already in the equation. "
                   f"It is not the solution.{worked} The answer is {answer}.")
         note = f"{copied[-1]} is in the problem, not the answer. {answer}"

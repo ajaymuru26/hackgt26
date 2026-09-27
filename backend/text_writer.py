@@ -9,7 +9,7 @@ from HersheyFonts import HersheyFonts
 STYLES = {"print": "futural", "cursive": "scripts"}
 FULL = 100.0        # render size used for measuring
 CAP = 0.75          # capital letters take up 75% of the font's full height
-LINE_GAP = 1.45     # line spacing, as a multiple of the capital height
+LINE_GAP = 2.05     # line spacing, as a multiple of the capital height
 
 
 @lru_cache(maxsize=None)
